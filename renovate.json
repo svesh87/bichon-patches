@@ -14,7 +14,7 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Upstream release the patches apply to",
+      "description": "Upstream release the patches apply to (tags of the svesh87/bichon mirror of rustmailer/bichon)",
       "managerFilePatterns": ["/^UPSTREAM$/"],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\n(?<currentValue>\\S+)"
@@ -53,7 +53,7 @@
     },
     {
       "description": "Upstream release: CI tries the patches on the new tag; red CI means the bichon-rebase skill on this PR's branch.",
-      "matchDepNames": ["rustmailer/bichon"],
+      "matchDepNames": ["svesh87/bichon"],
       "prBodyNotes": ["CI applies `patches/` to the new tag. Red CI: run the `bichon-rebase` skill on this branch (README.md, \"Updating to a new upstream release\")."]
     }
   ]

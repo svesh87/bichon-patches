@@ -13,29 +13,32 @@ every change's behaviour as README.md ("What the fork adds") describes it.
 
 1. Work on the branch of Renovate's PR (or a new branch `upstream-<tag>`), never on `main`.
 2. Read the upstream release notes between the old and the new tag
-   (`gh release view <tag> -R rustmailer/bichon`, and the compare view): breaking changes,
+   (`gh release view <tag> -R rustmailer/bichon` — the mirror svesh87/bichon has the tags,
+   not the release notes; and the compare view): breaking changes,
    moved files, renamed APIs the patches use. Note what touches the patched areas.
 3. `UPSTREAM` holds the new tag (Renovate already set it; otherwise edit the second line).
 
 ## Apply
 
 ```
-scripts/apply.sh --force
+scripts/rebase.sh
 ```
 
-`git am --3way` stops at the first patch that does not apply. For each stop:
+It applies the patches on the previous tag (where they apply cleanly) and rebases onto the
+new one — a real three-way merge. At conflicts it stops in `work/`:
 
-- `cd work && git am --show-current-patch=diff` — the patch; `git status` — the conflicts.
+- `cd work && git status` — the conflicts; `git diff` — the markers.
 - Resolve by intent, not by text: what the change is for is in README.md and in the patch's
   commit message. Upstream may have done part of it (then drop that part), moved the code
-  (follow it), or changed an API (adapt the call).
+  (follow it), or changed an API (adapt the call). Auto-merged files can still be wrong in
+  meaning where upstream rewrote the same area: the checks below catch most of it, read the
+  diff of those files too.
 - Keep the change as small as upstream allows: new code in new files, a few hooks in
-  upstream files (the existing patches follow this; keep it so).
-- `git add <files> && git am --continue`. A patch upstream made obsolete: `git am --skip`,
-  and say so in the report.
+  upstream files (the existing patch follows this; keep it so).
+- `git add <files> && GIT_EDITOR=true git rebase --continue` (commits in `work/` are
+  unsigned, rebase.sh sets that up).
 
-After the last patch: `cp -r ../overlay/. .` (apply.sh stops before the overlay when `am`
-stops) — or rerun `scripts/apply.sh --force` once all patches are exported.
+Then `cp -r ../overlay/. .` (rebase.sh does it itself when there were no conflicts).
 
 ## Check
 

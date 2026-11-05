@@ -5,11 +5,12 @@ upstream release, not as a fork of its history:
 
 | Path | What |
 |---|---|
-| `UPSTREAM` | the upstream tag the patches apply to (Renovate bumps it) |
+| `UPSTREAM` | the upstream tag the patches apply to, taken from [svesh87/bichon](https://github.com/svesh87/bichon) — a daily mirror of upstream's `main` and tags that outlives it (Renovate bumps the tag) |
 | `patches/` | the changes as one `git format-patch`, applied with `git am` (more patches only if a change ever needs to stay apart) |
 | `overlay/` | files copied over the patched tree as they are: the image's Dockerfile, `.dockerignore`, the checks script |
 | `scripts/apply.sh` | upstream tag + patches + overlay → `work/` (ignored by git): the tree CI checks and builds |
 | `scripts/export.sh` | commits in `work/` on top of the tag → `patches/` |
+| `scripts/rebase.sh` | move the patches to the tag now in `UPSTREAM`: apply on the previous tag, `git rebase` onto the new one (three-way merge) |
 | `.github/workflows/build.yml` | apply → checks → image |
 | `.claude/skills/bichon-rebase` | refresh the patches for a new upstream release |
 
@@ -51,10 +52,19 @@ comparison in gap-fill, immediate reconnects.
   the folder are the missing ones and are downloaded right away, without the header scan
   (upstream fetches `HEADER.FIELDS (MESSAGE-ID)` of every message; Yandex answers each batch
   in seconds, hours per folder). A changed UIDVALIDITY keeps the full header comparison.
+  Without the header scan upstream's archive-rule pre-filter (2.3.0) has nothing to work on:
+  such messages are downloaded and then dropped by the same rules at store time (chunked
+  download and import apply them too), so they are fetched but never archived.
+- **Import under server UIDs** (`crates/server/src/svesh_import.rs`, outside `/api/v1`):
+  `GET /svesh-api/archived-uids/:account/:mailbox`, `POST /svesh-api/import/:account/:mailbox?uid=&internal_date=`
+  with the raw message, for bodies a server no longer hands out but a mail client's offline
+  copy has. Answers `stored`, `exists` (UID archived), `duplicate` (same content under another
+  UID) or `filtered` (archive rules).
 - **Wait before reconnecting** (`crates/core/src/imap/reconnect.rs`): after a dropped
   connection every retry loop waits before the new LOGIN (upstream reconnected at once and
   waited afterwards; Yandex drops a LOGIN right after a drop).
-- **Image** `ghcr.io/svesh87/bichon:<upstream>-<run>`: built from source
+- **Image** `ghcr.io/svesh87/bichon:<upstream>-<build>` (build = CI run number + 100, after
+  the old fork's tags): built from source
   (`overlay/docker/svesh.Dockerfile`), runs as uid 1000, by `.github/workflows/build.yml`.
 
 ## Checks
@@ -93,8 +103,9 @@ conflicts by what each change is for (sections above), runs the checks, exports 
 and commits them to the branch. By hand, the same:
 
 ```
-scripts/apply.sh --force        # git am stops at the first patch that does not apply
-cd work && git am --show-current-patch=diff   # fix, git add, git am --continue
-.github/scripts/svesh-check.sh  # with web/dist stubbed, as in CI
+# UPSTREAM: the new tag
+scripts/rebase.sh               # stops at conflicts in work/: fix, git add, git rebase --continue
+cp -r overlay/. work/           # rebase.sh does it itself when there are no conflicts
+cd work && .github/scripts/svesh-check.sh   # with web/dist stubbed, as in CI
 cd .. && scripts/export.sh && git add patches UPSTREAM && git commit
 ```

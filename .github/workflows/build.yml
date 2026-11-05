@@ -79,7 +79,11 @@ jobs:
 
       - name: Upstream version
         id: version
-        run: echo "version=$(grep -v '^#' UPSTREAM | head -n 1)" >> "$GITHUB_OUTPUT"
+        # Build number = run number + 100: this repository took over the image from the old
+        # fork, whose tags went up to 2.2.0-11; new tags must sort after them.
+        run: |
+          echo "version=$(grep -v '^#' UPSTREAM | head -n 1)" >> "$GITHUB_OUTPUT"
+          echo "build=$(( ${{ github.run_number }} + 100 ))" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -112,7 +116,7 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=${{ steps.version.outputs.version }}-${{ github.run_number }}
+            type=raw,value=${{ steps.version.outputs.version }}-${{ steps.version.outputs.build }}
             type=sha,format=long
 
       - name: Log in to GHCR
