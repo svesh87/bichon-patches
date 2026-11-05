@@ -6,15 +6,15 @@ upstream release, not as a fork of its history:
 | Path | What |
 |---|---|
 | `UPSTREAM` | the upstream tag the patches apply to (Renovate bumps it) |
-| `patches/` | the changes, one `git format-patch` per change, applied in order with `git am` |
+| `patches/` | the changes as one `git format-patch`, applied with `git am` (more patches only if a change ever needs to stay apart) |
 | `overlay/` | files copied over the patched tree as they are: the image's Dockerfile, `.dockerignore`, the checks script |
 | `scripts/apply.sh` | upstream tag + patches + overlay → `work/` (ignored by git): the tree CI checks and builds |
 | `scripts/export.sh` | commits in `work/` on top of the tag → `patches/` |
 | `.github/workflows/build.yml` | apply → checks → image |
 | `.claude/skills/bichon-rebase` | refresh the patches for a new upstream release |
 
-Changing a patch: `scripts/apply.sh`, edit and commit in `work/` (amend the commit of that
-change or add one; `git rebase -i upstream` there), `scripts/export.sh`, commit `patches/`.
+Changing the patch: `scripts/apply.sh`, edit in `work/` and `git commit --amend` there (one
+commit on top of the tag), `scripts/export.sh`, commit `patches/`.
 ## What the fork adds
 
 The sync changes below form one **gentle mode for slow servers**, on only for accounts with

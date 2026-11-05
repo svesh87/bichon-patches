@@ -49,10 +49,9 @@ cd web && npx --yes pnpm@<version from build.yml> install --frozen-lockfile \
   && npx --yes pnpm@<same> exec vitest run src/features/accounts src/features/users
 ```
 
-A failure in the fork's code: fix it in the commit of that change (`git rebase -i upstream`
-in `work/`, or a fixup commit squashed in). Upstream's own failing tests are not ours: note
-them in the report (`git stash` the patches' effect is not needed — run the test on a clean
-`git -C work checkout upstream` to compare).
+A failure in the fork's code: fix it and `git commit --amend` in `work/` (the patch is one
+commit on top of the tag). Upstream's own failing tests are not ours: note them in the
+report — to tell, run that test on a clean `git -C work checkout upstream`.
 
 If the check script's file list or coverage regexes no longer match (a fork file moved), fix
 `overlay/.github/scripts/svesh-check.sh`, not `work/`.
