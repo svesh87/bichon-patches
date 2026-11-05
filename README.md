@@ -60,6 +60,11 @@ comparison in gap-fill, immediate reconnects.
   with the raw message, for bodies a server no longer hands out but a mail client's offline
   copy has. Answers `stored`, `exists` (UID archived), `duplicate` (same content under another
   UID) or `filtered` (archive rules).
+- **Russian search** (`crates/core/src/store/tantivy/svesh_ru.rs`, two filters in upstream's
+  word analyzer): `ё` → `е`, and every Cyrillic token reduced to its Snowball Russian stem
+  before the transliteration, so «договором», «договоры», «договор» are one term and «счёт»
+  equals «счет»; Latin queries for Russian words (`schet`) keep working. Latin tokens and
+  trigram fields are untouched. Changes index terms: `bichon-admin reindex` after an upgrade.
 - **Wait before reconnecting** (`crates/core/src/imap/reconnect.rs`): after a dropped
   connection every retry loop waits before the new LOGIN (upstream reconnected at once and
   waited afterwards; Yandex drops a LOGIN right after a drop).
