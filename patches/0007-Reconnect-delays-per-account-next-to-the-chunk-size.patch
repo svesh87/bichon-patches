@@ -1,0 +1,486 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sergei Sveshnikov <sergei@svesh.dev>
+Date: Fri, 30 Oct 2026 15:48:25 +0100
+Subject: [PATCH 07/10] Reconnect delays per account, next to the chunk size
+
+- Account field imap_reconnect_delays ("30,60,120"; "0" = no wait;
+  absent = server default BICHON_IMAP_RECONNECT_DELAYS, else 30,60,120),
+  create/update/view, clear_imap_reconnect_delays; validated in the API
+  and the form (whole seconds, up to 10 values). Gentle mode only.
+- Web UI: "Reconnect delays" in the account's download settings and
+  details; the chunk size description now says it bounds every response.
+- Tests: account API roundtrip for the delays, schema tests, account
+  delays over the server default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/admin/src/meta.rs                      |  1 +
+ crates/core/src/account/migration.rs          | 13 +++++++++
+ crates/core/src/account/payload.rs            | 18 ++++++++++++
+ crates/core/src/account/view.rs               |  3 ++
+ crates/core/src/imap/reconnect.rs             | 28 +++++++++++++------
+ crates/core/src/imap/reconnect_tests.rs       |  8 ++++++
+ crates/core/src/mailbox/delete.rs             |  1 +
+ crates/core/src/retention.rs                  |  1 +
+ crates/core/src/store/tantivy/envelope.rs     |  1 +
+ crates/server/src/mcp/tests.rs                | 20 +++++++++++++
+ web/src/api/account/api.ts                    |  2 ++
+ web/src/features/accounts/account-new.tsx     |  2 ++
+ .../accounts/account-settings-page.tsx        |  6 ++++
+ .../components/__tests__/chunk-kb.test.ts     | 19 +++++++++++++
+ .../accounts/components/account-detail.tsx    |  5 ++++
+ .../features/accounts/components/schema.ts    |  5 ++++
+ .../accounts/components/tab-download.tsx      | 26 +++++++++++++++++
+ web/src/locales/en.json                       |  5 +++-
+ web/src/locales/ru.json                       |  5 +++-
+ 19 files changed, 158 insertions(+), 11 deletions(-)
+
+diff --git a/crates/admin/src/meta.rs b/crates/admin/src/meta.rs
+index bbec35b..a742879 100644
+--- a/crates/admin/src/meta.rs
++++ b/crates/admin/src/meta.rs
+@@ -252,6 +252,7 @@ impl From<AccountV3> for AccountModel {
+             download_batch_size: value.sync_batch_size,
+             max_email_size_bytes: None,
+             imap_fetch_chunk_kb: None,
++            imap_reconnect_delays: None,
+             known_folders: value.known_folders,
+             created_at: value.created_at,
+             updated_at: value.updated_at,
+diff --git a/crates/core/src/account/migration.rs b/crates/core/src/account/migration.rs
+index ba57c1e..d3c9674 100644
+--- a/crates/core/src/account/migration.rs
++++ b/crates/core/src/account/migration.rs
+@@ -460,6 +460,11 @@ pub struct Account {
+     /// `None` = the server default (`BICHON_IMAP_FETCH_CHUNK_KB`), `0` = off.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub imap_fetch_chunk_kb: Option<u32>,
++    /// svesh: seconds to wait before each reconnect after a dropped connection,
++    /// comma-separated (`crate::imap::reconnect`), in the gentle mode only.
++    /// `None` = the server default (`BICHON_IMAP_RECONNECT_DELAYS`), `"0"` = none.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub imap_reconnect_delays: Option<String>,
+     pub known_folders: Option<BTreeSet<String>>,
+     pub created_at: i64,
+     pub updated_at: i64,
+@@ -583,6 +588,7 @@ impl Account {
+             download_batch_size: request.download_batch_size,
+             max_email_size_bytes: request.max_email_size_bytes,
+             imap_fetch_chunk_kb: request.imap_fetch_chunk_kb,
++            imap_reconnect_delays: request.imap_reconnect_delays,
+             date_before: request.date_before,
+             auto_download_new_mailboxes: request.auto_download_new_mailboxes,
+             imap_quota_bytes: request.imap_quota_bytes,
+@@ -1126,6 +1132,12 @@ impl Account {
+             if request.clear_imap_fetch_chunk_kb == Some(true) {
+                 new.imap_fetch_chunk_kb = None;
+             }
++            if let Some(delays) = &request.imap_reconnect_delays {
++                new.imap_reconnect_delays = Some(delays.clone());
++            }
++            if request.clear_imap_reconnect_delays == Some(true) {
++                new.imap_reconnect_delays = None;
++            }
+         }
+ 
+         if matches!(old.account_type, AccountType::NoSync) {
+@@ -1747,6 +1759,7 @@ mod tests {
+             download_batch_size: None,
+             max_email_size_bytes: None,
+             imap_fetch_chunk_kb: None,
++            imap_reconnect_delays: None,
+             use_dangerous: false,
+             pgp_key: None,
+             imap_quota_bytes: None,
+diff --git a/crates/core/src/account/payload.rs b/crates/core/src/account/payload.rs
+index bf19426..83f5b76 100644
+--- a/crates/core/src/account/payload.rs
++++ b/crates/core/src/account/payload.rs
+@@ -56,6 +56,14 @@ pub struct AccountCreateRequest {
+     #[cfg_attr(feature = "web-api", oai(validator(maximum(value = "65536"))))]
+     #[serde(default)]
+     pub imap_fetch_chunk_kb: Option<u32>,
++    /// svesh: seconds before each reconnect, comma-separated (e.g. `30,60,120`;
++    /// `0` = none); absent = server default. Gentle mode only.
++    #[cfg_attr(
++        feature = "web-api",
++        oai(validator(max_length = 100, pattern = r"^\d{1,5}(,\d{1,5}){0,9}$"))
++    )]
++    #[serde(default)]
++    pub imap_reconnect_delays: Option<String>,
+     pub use_dangerous: bool,
+     pub pgp_key: Option<String>,
+     pub imap_quota_bytes: Option<u64>,
+@@ -243,6 +251,16 @@ pub struct AccountUpdateRequest {
+     /// svesh: true = back to the server default for chunked download.
+     #[serde(default)]
+     pub clear_imap_fetch_chunk_kb: Option<bool>,
++    /// svesh: seconds before each reconnect, comma-separated; `0` = none.
++    #[cfg_attr(
++        feature = "web-api",
++        oai(validator(max_length = 100, pattern = r"^\d{1,5}(,\d{1,5}){0,9}$"))
++    )]
++    #[serde(default)]
++    pub imap_reconnect_delays: Option<String>,
++    /// svesh: true = back to the server default for reconnect delays.
++    #[serde(default)]
++    pub clear_imap_reconnect_delays: Option<bool>,
+     pub use_dangerous: Option<bool>,
+ 
+     pub pgp_key: Option<String>,
+diff --git a/crates/core/src/account/view.rs b/crates/core/src/account/view.rs
+index 87f756c..2da945e 100644
+--- a/crates/core/src/account/view.rs
++++ b/crates/core/src/account/view.rs
+@@ -47,6 +47,8 @@ pub struct AccountResp {
+     pub max_email_size_bytes: Option<u64>,
+     /// svesh: chunked body download, KB per part; `None` = server default, `0` = off.
+     pub imap_fetch_chunk_kb: Option<u32>,
++    /// svesh: seconds before each reconnect; `None` = server default.
++    pub imap_reconnect_delays: Option<String>,
+     pub known_folders: Option<BTreeSet<String>>,
+     pub created_at: i64,
+     pub updated_at: i64,
+@@ -101,6 +103,7 @@ impl AccountResp {
+             download_batch_size: account.download_batch_size,
+             max_email_size_bytes: account.max_email_size_bytes,
+             imap_fetch_chunk_kb: account.imap_fetch_chunk_kb,
++            imap_reconnect_delays: account.imap_reconnect_delays,
+             known_folders: account.known_folders,
+             created_at: account.created_at,
+             updated_at: account.updated_at,
+diff --git a/crates/core/src/imap/reconnect.rs b/crates/core/src/imap/reconnect.rs
+index 2dcec20..4101c84 100644
+--- a/crates/core/src/imap/reconnect.rs
++++ b/crates/core/src/imap/reconnect.rs
+@@ -24,8 +24,9 @@
+ //! failed" and the batch or folder was given up. Waiting before the new
+ //! LOGIN lets the server calm down.
+ //!
+-//! `BICHON_IMAP_RECONNECT_DELAYS`: seconds per attempt, comma-separated
+-//! (default `30,60,120`; the last value repeats; `0` = no wait).
++//! Seconds per attempt, comma-separated (the last value repeats; `0` = no
++//! wait): the account's "reconnect delays" setting, else the server default
++//! `BICHON_IMAP_RECONNECT_DELAYS`, else `30,60,120`. Gentle mode only.
+ 
+ use std::{sync::LazyLock, time::Duration};
+ 
+@@ -63,13 +64,22 @@ pub fn delay_for(attempt: u32, delays: &[u64]) -> Duration {
+ /// gentle mode (a chunk size set, `crate::imap::chunked`); others reconnect
+ /// at once, as upstream does.
+ pub async fn pause_before_reconnect(account_id: u64, attempt: u32) {
+-    let gentle = crate::imap::chunked::chunk_for_account(account_id).is_some();
+-    wait(
+-        account_id,
+-        attempt,
+-        delay_if(gentle, attempt, &RECONNECT_DELAYS),
+-    )
+-    .await;
++    let (gentle, delays) = match crate::account::migration::AccountModel::get(account_id) {
++        Ok(account) => (
++            crate::imap::chunked::is_gentle(&account),
++            account_delays(account.imap_reconnect_delays.as_deref()),
++        ),
++        Err(_) => (false, Vec::new()),
++    };
++    wait(account_id, attempt, delay_if(gentle, attempt, &delays)).await;
++}
++
++/// The account's own delays if set and valid, else the server default.
++pub fn account_delays(setting: Option<&str>) -> Vec<u64> {
++    match setting.map(str::trim).filter(|s| !s.is_empty()) {
++        Some(own) => parse_delays(Some(own)),
++        None => RECONNECT_DELAYS.clone(),
++    }
+ }
+ 
+ /// The delay for attempt `attempt`, or none outside the gentle mode.
+diff --git a/crates/core/src/imap/reconnect_tests.rs b/crates/core/src/imap/reconnect_tests.rs
+index e54381e..53a1c40 100644
+--- a/crates/core/src/imap/reconnect_tests.rs
++++ b/crates/core/src/imap/reconnect_tests.rs
+@@ -35,6 +35,14 @@ fn no_delay_outside_the_gentle_mode() {
+     assert_eq!(delay_if(true, 1, &[30]), Duration::from_secs(30));
+ }
+ 
++#[test]
++fn account_setting_wins_over_server_default() {
++    assert_eq!(account_delays(Some("5,10")), vec![5, 10]);
++    assert_eq!(account_delays(Some("0")), vec![0]);
++    assert_eq!(account_delays(None), *RECONNECT_DELAYS);
++    assert_eq!(account_delays(Some("  ")), *RECONNECT_DELAYS);
++}
++
+ #[test]
+ fn delay_per_attempt_repeats_the_last() {
+     let delays = [5, 10];
+diff --git a/crates/core/src/mailbox/delete.rs b/crates/core/src/mailbox/delete.rs
+index 6df522c..1aee425 100644
+--- a/crates/core/src/mailbox/delete.rs
++++ b/crates/core/src/mailbox/delete.rs
+@@ -123,6 +123,7 @@ mod tests {
+             download_batch_size: None,
+             max_email_size_bytes: None,
+             imap_fetch_chunk_kb: None,
++            imap_reconnect_delays: None,
+             use_dangerous: false,
+             pgp_key: None,
+             imap_quota_bytes: None,
+diff --git a/crates/core/src/retention.rs b/crates/core/src/retention.rs
+index f21120c..c1e2708 100644
+--- a/crates/core/src/retention.rs
++++ b/crates/core/src/retention.rs
+@@ -191,6 +191,7 @@ mod tests {
+             download_batch_size: None,
+             max_email_size_bytes: None,
+             imap_fetch_chunk_kb: None,
++            imap_reconnect_delays: None,
+             use_dangerous: false,
+             pgp_key: None,
+             imap_quota_bytes: None,
+diff --git a/crates/core/src/store/tantivy/envelope.rs b/crates/core/src/store/tantivy/envelope.rs
+index 3ec2dc0..276fd67 100644
+--- a/crates/core/src/store/tantivy/envelope.rs
++++ b/crates/core/src/store/tantivy/envelope.rs
+@@ -3377,6 +3377,7 @@ mod tests {
+             download_batch_size: None,
+             max_email_size_bytes: None,
+             imap_fetch_chunk_kb: None,
++            imap_reconnect_delays: None,
+             use_dangerous: false,
+             pgp_key: None,
+             imap_quota_bytes: None,
+diff --git a/crates/server/src/mcp/tests.rs b/crates/server/src/mcp/tests.rs
+index 777e451..ad90b56 100644
+--- a/crates/server/src/mcp/tests.rs
++++ b/crates/server/src/mcp/tests.rs
+@@ -707,6 +707,26 @@ async fn account_chunk_setting_roundtrip() {
+     assert_eq!(stored(read().await), None);
+     assert_eq!(chunk_for_account(id), *CHUNK_BYTES);
+ 
++    // Reconnect delays: set, kept by other updates, cleared; invalid refused.
++    let delays = |body: Value| {
++        body.get("imap_reconnect_delays")
++            .filter(|v| !v.is_null())
++            .cloned()
++    };
++    update(json!({"imap_reconnect_delays": "5,10"})).await;
++    assert_eq!(delays(read().await), Some(json!("5,10")));
++    update(json!({"account_name": "Chunks 2"})).await;
++    assert_eq!(delays(read().await), Some(json!("5,10")));
++    update(json!({"clear_imap_reconnect_delays": true})).await;
++    assert_eq!(delays(read().await), None);
++    let resp = api()
++        .post(format!("/api/v1/account/{id}"))
++        .header("Authorization", &auth)
++        .body_json(&json!({"imap_reconnect_delays": "30; 60"}))
++        .send()
++        .await;
++    assert!(resp.0.status().is_client_error());
++
+     // Out of range is refused by the API.
+     let resp = api()
+         .post(format!("/api/v1/account/{id}"))
+diff --git a/web/src/api/account/api.ts b/web/src/api/account/api.ts
+index 007c00d..8c5f628 100644
+--- a/web/src/api/account/api.ts
++++ b/web/src/api/account/api.ts
+@@ -194,6 +194,8 @@ export interface AccountModel {
+     max_email_size_bytes?: number;
+     // svesh: chunked download, KB per part; absent = server default, 0 = off.
+     imap_fetch_chunk_kb?: number;
++    // svesh: seconds before each reconnect ("30,60,120"); absent = server default.
++    imap_reconnect_delays?: string;
+     created_by: number;
+     created_user_name: string;
+     created_user_email: string;
+diff --git a/web/src/features/accounts/account-new.tsx b/web/src/features/accounts/account-new.tsx
+index 07019dd..f42a343 100644
+--- a/web/src/features/accounts/account-new.tsx
++++ b/web/src/features/accounts/account-new.tsx
+@@ -58,6 +58,7 @@ const defaultValues: AccountFormValues = {
+   download_batch_size: 30,
+   max_email_size_bytes: 100 * 1024 * 1024,
+   imap_fetch_chunk_kb: undefined,
++  imap_reconnect_delays: undefined,
+   auto_download_new_mailboxes: true,
+   download_schedule: undefined,
+   archive_rules: undefined,
+@@ -137,6 +138,7 @@ export function AccountNewPage() {
+         download_batch_size: data.download_batch_size,
+         max_email_size_bytes: data.max_email_size_bytes,
+         imap_fetch_chunk_kb: data.imap_fetch_chunk_kb,
++        imap_reconnect_delays: data.imap_reconnect_delays || undefined,
+         auto_download_new_mailboxes: data.auto_download_new_mailboxes,
+         download_schedule: data.download_schedule || null,
+         account_type: "IMAP",
+diff --git a/web/src/features/accounts/account-settings-page.tsx b/web/src/features/accounts/account-settings-page.tsx
+index 7b51176..1af1112 100644
+--- a/web/src/features/accounts/account-settings-page.tsx
++++ b/web/src/features/accounts/account-settings-page.tsx
+@@ -64,6 +64,7 @@ function mapAccountToFormValues(account: AccountModel): AccountFormValues {
+     download_batch_size: account.download_batch_size ?? 30,
+     max_email_size_bytes: account.max_email_size_bytes ?? 100 * 1024 * 1024,
+     imap_fetch_chunk_kb: account.imap_fetch_chunk_kb ?? undefined,
++    imap_reconnect_delays: account.imap_reconnect_delays ?? undefined,
+     auto_download_new_mailboxes: account.auto_download_new_mailboxes ?? false,
+     download_schedule: account.download_schedule ?? undefined,
+     archive_rules: account.archive_rules ?? undefined,
+@@ -173,6 +174,11 @@ export function AccountSettingsPage({ accountId }: AccountSettingsPageProps) {
+       } else if (account?.imap_fetch_chunk_kb !== undefined && account?.imap_fetch_chunk_kb !== null) {
+         payload.clear_imap_fetch_chunk_kb = true;
+       }
++      if (data.imap_reconnect_delays) {
++        payload.imap_reconnect_delays = data.imap_reconnect_delays;
++      } else if (account?.imap_reconnect_delays) {
++        payload.clear_imap_reconnect_delays = true;
++      }
+ 
+       if (data.retention_days !== undefined) {
+         payload.retention_days = data.retention_days || 0;
+diff --git a/web/src/features/accounts/components/__tests__/chunk-kb.test.ts b/web/src/features/accounts/components/__tests__/chunk-kb.test.ts
+index 917b3fa..9f04813 100644
+--- a/web/src/features/accounts/components/__tests__/chunk-kb.test.ts
++++ b/web/src/features/accounts/components/__tests__/chunk-kb.test.ts
+@@ -42,3 +42,22 @@ describe('Account Schema - imap_fetch_chunk_kb', () => {
+     }
+   })
+ })
++
++describe('Account Schema - imap_reconnect_delays', () => {
++  const schema = getAccountSchema(false, t)
++
++  it.each(['30,60,120', '0', '5'])('accepts %s', (value) => {
++    expect(schema.safeParse({ ...baseData, imap_reconnect_delays: value }).success).toBe(true)
++  })
++
++  it.each(['', '30, 60', '30;60', '-1', 'a', '1,2,3,4,5,6,7,8,9,10,11', '123456'])(
++    'rejects %s',
++    (value) => {
++      const result = schema.safeParse({ ...baseData, imap_reconnect_delays: value })
++      expect(result.success).toBe(false)
++      if (!result.success) {
++        expect(result.error.issues[0].message).toBe('validation.imapReconnectDelaysInvalid')
++      }
++    }
++  )
++})
+diff --git a/web/src/features/accounts/components/account-detail.tsx b/web/src/features/accounts/components/account-detail.tsx
+index cc01937..f138da3 100644
+--- a/web/src/features/accounts/components/account-detail.tsx
++++ b/web/src/features/accounts/components/account-detail.tsx
+@@ -277,6 +277,11 @@ export function AccountDetailDrawer({ open, onOpenChange, currentRow }: Props) {
+                           ? t('accounts.imapFetchChunkKbOff', 'Off')
+                           : `${row.imap_fetch_chunk_kb} KB`}
+                     </InfoRow>
++                    <InfoRow label={t('accounts.imapReconnectDelays', 'Reconnect delays')}>
++                      {row.imap_reconnect_delays
++                        ? `${row.imap_reconnect_delays} s`
++                        : t('accounts.imapFetchChunkKbDefault', 'Server default')}
++                    </InfoRow>
+                     <InfoRow label={t('accounts.downloadSchedule', 'Download schedule')}>
+                       {row.download_schedule
+                         ? (
+diff --git a/web/src/features/accounts/components/schema.ts b/web/src/features/accounts/components/schema.ts
+index cee5bd8..2a2b815 100644
+--- a/web/src/features/accounts/components/schema.ts
++++ b/web/src/features/accounts/components/schema.ts
+@@ -169,6 +169,11 @@ export const getAccountSchema = (isEdit: boolean, t: (key: string) => string) =>
+       .min(0, { message: t('validation.imapFetchChunkKbInvalid') })
+       .max(65536, { message: t('validation.imapFetchChunkKbInvalid') })
+       .optional(),
++    // svesh: seconds before each reconnect, comma-separated; empty = server default.
++    imap_reconnect_delays: z
++      .string()
++      .regex(/^\d{1,5}(,\d{1,5}){0,9}$/, { message: t('validation.imapReconnectDelaysInvalid') })
++      .optional(),
+     auto_download_new_mailboxes: z.boolean(),
+     download_schedule: z
+       .string()
+diff --git a/web/src/features/accounts/components/tab-download.tsx b/web/src/features/accounts/components/tab-download.tsx
+index 4edb08c..7728cda 100644
+--- a/web/src/features/accounts/components/tab-download.tsx
++++ b/web/src/features/accounts/components/tab-download.tsx
+@@ -454,6 +454,32 @@ export function TabDownload() {
+               </FormItem>
+             )}
+           />
++          {/* svesh: reconnect delays (gentle mode) */}
++          <FormField
++            control={control}
++            name="imap_reconnect_delays"
++            render={({ field }) => (
++              <FormItem>
++                <FormLabel>{t('accounts.imapReconnectDelays')}</FormLabel>
++                <FormControl>
++                  <div className="flex items-center gap-2">
++                    <Input
++                      className="flex-1"
++                      placeholder="30,60,120"
++                      value={field.value ?? ''}
++                      onChange={(e) => {
++                        const value = e.target.value.replace(/\s+/g, '');
++                        field.onChange(value === '' ? undefined : value);
++                      }}
++                    />
++                    <span className="text-sm text-muted-foreground whitespace-nowrap">s</span>
++                  </div>
++                </FormControl>
++                <FormDescription>{t('accounts.imapReconnectDelaysDescription')}</FormDescription>
++                <FormMessage />
++              </FormItem>
++            )}
++          />
+         </div>
+       </div>
+ 
+diff --git a/web/src/locales/en.json b/web/src/locales/en.json
+index 7bdadbe..d51abe0 100644
+--- a/web/src/locales/en.json
++++ b/web/src/locales/en.json
+@@ -271,9 +271,11 @@
+     "maxEmailSizeBytes": "Max email size",
+     "maxEmailSizeBytesDescription": "Emails larger than this will be skipped. Leave empty to use the default (100 MB).",
+     "imapFetchChunkKb": "Chunk size",
+-    "imapFetchChunkKbDescription": "Download each message on its own in parts of this size, like Thunderbird (136 KB), for servers that drop large responses (Yandex). Empty = server default, 0 = off (whole messages in batches).",
++    "imapFetchChunkKbDescription": "Gentle mode for servers that drop large responses (Yandex): no server response is larger than this. Small messages come together up to this size, larger ones in parts of it (Thunderbird uses 136 KB). Empty = server default, 0 = off (upstream behaviour).",
+     "imapFetchChunkKbDefault": "Server default",
+     "imapFetchChunkKbOff": "Off",
++    "imapReconnectDelays": "Reconnect delays",
++    "imapReconnectDelaysDescription": "Seconds to wait before each reconnect after a dropped connection, comma-separated (the last repeats). Only with a chunk size set. Empty = server default (30,60,120), 0 = no wait.",
+     "maxEmailSizeBytesPlaceholder": "Default: 100 MB",
+     "maxEmailSizeBytesUnlimited": "Default: 100 MB",
+     "minutes": "minutes",
+@@ -3091,6 +3093,7 @@
+     "maxEmailSizeMustBeNumber": "Max email size must be a number.",
+     "maxEmailSizeTooLarge": "Max email size must not exceed 100 MB.",
+     "imapFetchChunkKbInvalid": "Chunk size: a whole number of KB from 0 to 65536.",
++    "imapReconnectDelaysInvalid": "Reconnect delays: whole seconds separated by commas, e.g. 30,60,120.",
+     "maxEmailSizeTooSmall": "Max email size must be at least 1 MB.",
+     "passwordMinLength": "Password must be at least {{min}} characters long",
+     "passwordRequired": "Password is required when auth method is Password",
+diff --git a/web/src/locales/ru.json b/web/src/locales/ru.json
+index 215f68c..997435c 100644
+--- a/web/src/locales/ru.json
++++ b/web/src/locales/ru.json
+@@ -271,9 +271,11 @@
+     "maxEmailSizeBytes": "Макс. размер письма",
+     "maxEmailSizeBytesDescription": "Письма больше этого размера будут пропущены. Оставьте пустым для использования значения по умолчанию (100 МБ).",
+     "imapFetchChunkKb": "Размер куска",
+-    "imapFetchChunkKbDescription": "Скачивать каждое письмо отдельно, частями такого размера, как Thunderbird (136 КБ): для серверов, которые рвут большие ответы (Яндекс). Пусто — значение сервера, 0 — выключено (целые письма пакетами).",
++    "imapFetchChunkKbDescription": "Щадящий режим для серверов, которые рвут большие ответы (Яндекс): ни один ответ сервера не больше этого размера. Мелкие письма идут пачкой до этого размера, крупные — частями такого размера (у Thunderbird 136 КБ). Пусто — значение сервера, 0 — выключено (как в исходном Bichon).",
+     "imapFetchChunkKbDefault": "Значение сервера",
+     "imapFetchChunkKbOff": "Выключено",
++    "imapReconnectDelays": "Паузы переподключения",
++    "imapReconnectDelaysDescription": "Сколько секунд ждать перед каждым переподключением после обрыва, через запятую (последнее повторяется). Работает, только если задан размер куска. Пусто — значение сервера (30,60,120), 0 — без паузы.",
+     "maxEmailSizeBytesPlaceholder": "По умолчанию: 100 МБ",
+     "maxEmailSizeBytesUnlimited": "По умолчанию: 100 МБ",
+     "minutes": "минут",
+@@ -3091,6 +3093,7 @@
+     "maxEmailSizeMustBeNumber": "Максимальный размер письма должен быть числом.",
+     "maxEmailSizeTooLarge": "Максимальный размер письма не должен превышать 100 МБ.",
+     "imapFetchChunkKbInvalid": "Размер куска — целое число КБ от 0 до 65536.",
++    "imapReconnectDelaysInvalid": "Паузы — целые секунды через запятую, например 30,60,120.",
+     "maxEmailSizeTooSmall": "Максимальный размер письма должен быть не менее 1 МБ.",
+     "passwordMinLength": "Пароль должен быть не менее {{min}} символов",
+     "passwordRequired": "Пароль обязателен, когда метод авторизации - Пароль",

@@ -1,0 +1,60 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "bichon-patches: the upstream tag (UPSTREAM) and the build's own tools (base images, actions); upstream's Cargo/npm dependencies come with the upstream tag.",
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
+  "enabledManagers": ["dockerfile", "github-actions", "custom.regex"],
+  "minimumReleaseAge": "14 days",
+  "internalChecksFilter": "strict",
+  "dockerfile": {
+    "managerFilePatterns": ["/^overlay/docker/svesh\\.Dockerfile$/"]
+  },
+  "github-actions": {
+    "managerFilePatterns": ["/^\\.github/workflows/build\\.ya?ml$/"]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Upstream release the patches apply to",
+      "managerFilePatterns": ["/^UPSTREAM$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\n(?<currentValue>\\S+)"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "Rust of the check job (same versions as the rust image in the Dockerfile)",
+      "managerFilePatterns": ["/^\\.github/workflows/build\\.yml$/"],
+      "matchStrings": ["RUST_VERSION: \"(?<currentValue>[^\"]+)\""],
+      "depNameTemplate": "rust",
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "cargo-llvm-cov of the check job",
+      "managerFilePatterns": ["/^\\.github/workflows/build\\.yml$/"],
+      "matchStrings": ["CARGO_LLVM_COV_VERSION: \"(?<currentValue>[^\"]+)\""],
+      "depNameTemplate": "cargo-llvm-cov",
+      "datasourceTemplate": "crate"
+    },
+    {
+      "customType": "regex",
+      "description": "pnpm in the Dockerfile",
+      "managerFilePatterns": ["/^overlay/docker/svesh\\.Dockerfile$/"],
+      "matchStrings": ["npm install -g pnpm@(?<currentValue>\\S+)"],
+      "depNameTemplate": "pnpm",
+      "datasourceTemplate": "npm"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Node: stay on the 24 LTS line",
+      "matchDepNames": ["node"],
+      "allowedVersions": "/^24\\./"
+    },
+    {
+      "description": "Upstream release: CI tries the patches on the new tag; red CI means the bichon-rebase skill on this PR's branch.",
+      "matchDepNames": ["rustmailer/bichon"],
+      "prBodyNotes": ["CI applies `patches/` to the new tag. Red CI: run the `bichon-rebase` skill on this branch (README.md, \"Updating to a new upstream release\")."]
+    }
+  ]
+}

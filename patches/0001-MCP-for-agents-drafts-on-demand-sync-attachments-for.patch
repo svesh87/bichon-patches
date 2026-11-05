@@ -1,0 +1,2377 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sergei Sveshnikov <sergei@svesh.dev>
+Date: Thu, 29 Oct 2026 16:48:33 +0100
+Subject: [PATCH 01/10] MCP for agents: drafts, on-demand sync, attachments;
+ fork image and checks
+
+- crates/server/src/mcp: MCP endpoint at /mcp (BICHON_ENABLE_MCP), based on
+  upstream's unfinished feature/add-mcp branch. Tools: list_accounts,
+  list_folders, sync_now, search_emails, get_email, get_thread,
+  save_attachments, save_draft. Nothing sends, deletes or moves mail.
+- save_draft builds the message (reply threading, attachments from
+  BICHON_MCP_FILES_DIR only) and APPENDs it to \Drafts with \Draft \Seen.
+- Account permissions account:sync and data:draft for agent tokens.
+- Single JSON-RPC responses instead of one-element batches (MCP 2025-06-18).
+- docker/svesh.Dockerfile (from source, uid 1000), svesh-build workflow
+  (check -> image to ghcr.io/svesh87/bichon), Renovate for the fork's own
+  build and upstream releases, SVESH.md.
+- Checks: rustfmt, clippy, MCP tests incl. a scripted IMAP server, line
+  coverage of the MCP module >= 80% (94.6% now).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                           |  125 ++++
+ crates/core/src/users/permissions.rs |   16 +
+ crates/server/Cargo.toml             |    6 +
+ crates/server/src/lib.rs             |    1 +
+ crates/server/src/mcp/draft.rs       |  315 ++++++++
+ crates/server/src/mcp/files.rs       |  101 +++
+ crates/server/src/mcp/mod.rs         |  100 +++
+ crates/server/src/mcp/tests.rs       | 1028 ++++++++++++++++++++++++++
+ crates/server/src/mcp/tools.rs       |  495 +++++++++++++
+ crates/server/src/rest/mod.rs        |   13 +
+ 10 files changed, 2200 insertions(+)
+ create mode 100644 crates/server/src/mcp/draft.rs
+ create mode 100644 crates/server/src/mcp/files.rs
+ create mode 100644 crates/server/src/mcp/mod.rs
+ create mode 100644 crates/server/src/mcp/tests.rs
+ create mode 100644 crates/server/src/mcp/tools.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index c6b8d28..125daaf 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -245,6 +245,28 @@ dependencies = [
+  "tokio",
+ ]
+ 
++[[package]]
++name = "async-stream"
++version = "0.3.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
++dependencies = [
++ "async-stream-impl",
++ "futures-core",
++ "pin-project-lite",
++]
++
++[[package]]
++name = "async-stream-impl"
++version = "0.3.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
+ [[package]]
+ name = "async-trait"
+ version = "0.1.92"
+@@ -481,10 +503,15 @@ dependencies = [
+  "futures",
+  "governor",
+  "http",
++ "mail-parser",
++ "mail-send",
++ "mime_guess",
+  "poem",
+  "poem-derive",
++ "poem-mcpserver",
+  "poem-openapi",
+  "rust-embed",
++ "schemars",
+  "serde",
+  "serde_json",
+  "sha2 0.10.9",
+@@ -1376,6 +1403,12 @@ version = "1.0.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+ 
++[[package]]
++name = "dyn-clone"
++version = "1.0.20"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
++
+ [[package]]
+ name = "either"
+ version = "1.19.0"
+@@ -3567,6 +3600,42 @@ dependencies = [
+  "syn 2.0.119",
+ ]
+ 
++[[package]]
++name = "poem-mcpserver"
++version = "0.3.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "45f7e0566560432a9a093ef5410b495a90da4bec16595594ebc51205ed760ea6"
++dependencies = [
++ "async-stream",
++ "base64 0.22.1",
++ "itertools 0.14.0",
++ "mime",
++ "pin-project-lite",
++ "poem",
++ "poem-mcpserver-macros",
++ "rand 0.9.2",
++ "schemars",
++ "serde",
++ "serde_json",
++ "time",
++ "tokio",
++ "tokio-stream",
++ "tracing",
++]
++
++[[package]]
++name = "poem-mcpserver-macros"
++version = "0.3.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0e459d93682bcdd23ea09259b370231a3bb6ad43904c6215d52d891db91edb84"
++dependencies = [
++ "darling 0.20.11",
++ "proc-macro-crate",
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
+ [[package]]
+ name = "poem-openapi"
+ version = "5.1.16"
+@@ -3991,6 +4060,26 @@ dependencies = [
+  "bitflags",
+ ]
+ 
++[[package]]
++name = "ref-cast"
++version = "1.0.27"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7e440fb4e4b4147295338efb76001ab9e4efc0e5839df2c47fc5ac2381d365c3"
++dependencies = [
++ "ref-cast-impl",
++]
++
++[[package]]
++name = "ref-cast-impl"
++version = "1.0.27"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "92ecd8964f8453721699a1ed72037b0db49ce2f5a5138486ee89bed6f67cdf3a"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.8",
++]
++
+ [[package]]
+ name = "regex"
+ version = "1.13.1"
+@@ -4328,6 +4417,31 @@ dependencies = [
+  "windows-sys 0.61.2",
+ ]
+ 
++[[package]]
++name = "schemars"
++version = "1.2.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
++dependencies = [
++ "dyn-clone",
++ "ref-cast",
++ "schemars_derive",
++ "serde",
++ "serde_json",
++]
++
++[[package]]
++name = "schemars_derive"
++version = "1.2.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e1c3a92094fa7d61aa124645844facb6b554dfc797136d0f5fd1f890e2bffc69"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "serde_derive_internals",
++ "syn 3.0.8",
++]
++
+ [[package]]
+ name = "scopeguard"
+ version = "1.2.0"
+@@ -4403,6 +4517,17 @@ dependencies = [
+  "syn 3.0.8",
+ ]
+ 
++[[package]]
++name = "serde_derive_internals"
++version = "0.30.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.8",
++]
++
+ [[package]]
+ name = "serde_json"
+ version = "1.0.154"
+diff --git a/crates/core/src/users/permissions.rs b/crates/core/src/users/permissions.rs
+index d5b6e31..a16f5a8 100644
+--- a/crates/core/src/users/permissions.rs
++++ b/crates/core/src/users/permissions.rs
+@@ -144,6 +144,14 @@ impl Permission {
+     /// Allow SMTP ingestion into SPECIFIC accounts.
+     pub const DATA_SMTP_INGEST: &str = "data:smtp:ingest";
+ 
++    /// svesh: start a download (sync) of SPECIFIC accounts now, without the
++    /// rest of `account:manage` (MCP `sync_now`).
++    pub const ACCOUNT_SYNC: &str = "account:sync";
++
++    /// svesh: save drafts into the Drafts folder of SPECIFIC accounts on the
++    /// IMAP server (MCP `save_draft`). Never sends.
++    pub const DATA_DRAFT: &str = "data:draft";
++
+     pub fn global_permissions() -> Vec<(&'static str, &'static str)> {
+         vec![
+             (
+@@ -246,6 +254,14 @@ impl Permission {
+                 Self::DATA_SMTP_INGEST,
+                 "Receive and archive emails via SMTP for authorized accounts.",
+             ),
++            (
++                Self::ACCOUNT_SYNC,
++                "Start a sync of authorized accounts now (MCP).",
++            ),
++            (
++                Self::DATA_DRAFT,
++                "Save drafts into the Drafts folder of authorized accounts (MCP; never sends).",
++            ),
+         ]
+     }
+ 
+diff --git a/crates/server/Cargo.toml b/crates/server/Cargo.toml
+index 09560c1..e165b79 100644
+--- a/crates/server/Cargo.toml
++++ b/crates/server/Cargo.toml
+@@ -38,6 +38,12 @@ sysinfo.workspace = true
+ base64.workspace = true
+ uuid.workspace = true
+ sha2 = "0.10"
++# svesh: MCP endpoint (crates/server/src/mcp).
++poem-mcpserver = { version = "=0.3.1", features = ["streamable-http"] }
++schemars = "1.0"
++mail-parser.workspace = true
++mail-send.workspace = true
++mime_guess.workspace = true
+ 
+ [dev-dependencies]
+ poem = { version = "3.1.12", features = ["test"] }
+diff --git a/crates/server/src/lib.rs b/crates/server/src/lib.rs
+index 6865083..c7f9143 100644
+--- a/crates/server/src/lib.rs
++++ b/crates/server/src/lib.rs
+@@ -19,6 +19,7 @@
+ pub mod common;
+ pub mod error;
+ pub mod export;
++pub mod mcp;
+ pub mod rest;
+ 
+ #[cfg(test)]
+diff --git a/crates/server/src/mcp/draft.rs b/crates/server/src/mcp/draft.rs
+new file mode 100644
+index 0000000..4beaa8a
+--- /dev/null
++++ b/crates/server/src/mcp/draft.rs
+@@ -0,0 +1,315 @@
++//
++// Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
++//
++// This file is part of the Bichon Email Archiving Project
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++//! Drafts: build a message and APPEND it to the account's Drafts folder on
++//! the IMAP server. Nothing is ever sent; the owner sends from their client.
++
++use bichon_core::{
++    account::migration::{AccountModel, AccountType},
++    archive::imap::mailbox::{Attribute, AttributeEnum, MailBox},
++    envelope::extractor::reattach_eml_content,
++    imap::executor::ImapExecutor,
++};
++use mail_parser::{HeaderValue, MessageParser};
++use mail_send::mail_builder::{headers::address::Address, MessageBuilder};
++use serde::Serialize;
++
++use super::files::{resolve_input, MAX_DRAFT_ATTACHMENTS_BYTES};
++
++#[derive(Default)]
++pub struct DraftRequest {
++    pub account_id: u64,
++    pub to: Vec<String>,
++    pub cc: Vec<String>,
++    pub bcc: Vec<String>,
++    pub subject: Option<String>,
++    pub text: Option<String>,
++    pub html: Option<String>,
++    pub reply_to_envelope_id: Option<String>,
++    pub attachments: Vec<String>,
++    pub folder: Option<String>,
++}
++
++#[derive(Serialize, Debug)]
++pub struct DraftSaved {
++    pub account: String,
++    pub folder: String,
++    pub message_id: String,
++    pub subject: String,
++    pub to: Vec<String>,
++    pub attachments: Vec<String>,
++    pub size: usize,
++}
++
++/// What a reply takes from the original message.
++#[derive(Debug, Default)]
++pub struct ReplyContext {
++    pub message_id: Option<String>,
++    pub references: Vec<String>,
++    pub subject: String,
++    pub reply_to: Vec<String>,
++}
++
++/// A file to attach: MIME type, file name, content.
++pub type DraftFile = (String, String, Vec<u8>);
++
++/// A built draft, ready to be appended.
++#[derive(Debug)]
++pub struct BuiltDraft {
++    pub raw: Vec<u8>,
++    pub message_id: String,
++    pub subject: String,
++    pub to: Vec<String>,
++    pub attachments: Vec<String>,
++}
++
++pub fn reply_context(eml: &[u8]) -> Result<ReplyContext, String> {
++    let message = MessageParser::default()
++        .parse(eml)
++        .ok_or("Original message: failed to parse EML")?;
++    let mut references: Vec<String> = match message.references() {
++        HeaderValue::Text(id) => vec![id.to_string()],
++        HeaderValue::TextList(ids) => ids.iter().map(|id| id.to_string()).collect(),
++        _ => Vec::new(),
++    };
++    let message_id = message.message_id().map(str::to_string);
++    if let Some(id) = &message_id {
++        references.push(id.clone());
++    }
++    let reply_to = message
++        .reply_to()
++        .or_else(|| message.from())
++        .map(|list| {
++            list.iter()
++                .filter_map(|addr| addr.address().map(str::to_string))
++                .collect()
++        })
++        .unwrap_or_default();
++    Ok(ReplyContext {
++        message_id,
++        references,
++        subject: message.subject().unwrap_or_default().to_string(),
++        reply_to,
++    })
++}
++
++pub fn reply_subject(original: &str) -> String {
++    let lower = original.trim_start().to_lowercase();
++    if lower.starts_with("re:") || lower.starts_with("re[") {
++        original.to_string()
++    } else {
++        format!("Re: {original}")
++    }
++}
++
++/// Read the attachments: only regular files from the file exchange directory,
++/// at most `MAX_DRAFT_ATTACHMENTS_BYTES` in total.
++pub fn read_attachments(paths: &[String]) -> Result<Vec<DraftFile>, String> {
++    let mut files = Vec::new();
++    let mut total: u64 = 0;
++    for path in paths {
++        let real = resolve_input(path)?;
++        let content = std::fs::read(&real).map_err(|e| format!("Read {}: {e}", real.display()))?;
++        total += content.len() as u64;
++        if total > MAX_DRAFT_ATTACHMENTS_BYTES {
++            return Err(format!(
++                "Attachments exceed {} MB in total",
++                MAX_DRAFT_ATTACHMENTS_BYTES / 1024 / 1024
++            ));
++        }
++        let name = real
++            .file_name()
++            .map(|n| n.to_string_lossy().to_string())
++            .unwrap_or_else(|| "attachment".into());
++        let mime = mime_guess::from_path(&real)
++            .first_or_octet_stream()
++            .to_string();
++        files.push((mime, name, content));
++    }
++    Ok(files)
++}
++
++/// Build the RFC 822 draft. The sender is the account itself.
++pub fn build_draft(
++    account_email: &str,
++    account_name: Option<&str>,
++    req: &DraftRequest,
++    reply: Option<&ReplyContext>,
++    files: Vec<DraftFile>,
++) -> Result<BuiltDraft, String> {
++    let to = if req.to.is_empty() {
++        reply.map(|r| r.reply_to.clone()).unwrap_or_default()
++    } else {
++        req.to.clone()
++    };
++    if to.is_empty() {
++        return Err("No recipients: give `to` (or reply to a message that has a sender)".into());
++    }
++    let subject = match (&req.subject, reply) {
++        (Some(subject), _) => subject.clone(),
++        (None, Some(reply)) => reply_subject(&reply.subject),
++        (None, None) => return Err("No subject".into()),
++    };
++    if req.text.is_none() && req.html.is_none() {
++        return Err("No body: give `text` and/or `html`".into());
++    }
++
++    let domain = account_email.rsplit('@').next().unwrap_or("localhost");
++    let message_id = format!("{}@{}", uuid::Uuid::new_v4(), domain);
++    let from: Address = match account_name {
++        Some(name) if !name.trim().is_empty() => {
++            (name.to_string(), account_email.to_string()).into()
++        }
++        _ => account_email.to_string().into(),
++    };
++    let mut builder = MessageBuilder::new()
++        .from(from)
++        .to(to.clone())
++        .subject(subject.clone())
++        .message_id(message_id.clone());
++    if !req.cc.is_empty() {
++        builder = builder.cc(req.cc.clone());
++    }
++    if !req.bcc.is_empty() {
++        builder = builder.bcc(req.bcc.clone());
++    }
++    if let Some(reply) = reply {
++        if let Some(id) = &reply.message_id {
++            builder = builder.in_reply_to(id.clone());
++        }
++        if !reply.references.is_empty() {
++            builder = builder.references(reply.references.clone());
++        }
++    }
++    if let Some(text) = &req.text {
++        builder = builder.text_body(text.clone());
++    }
++    if let Some(html) = &req.html {
++        builder = builder.html_body(html.clone());
++    }
++    let mut attachments = Vec::new();
++    for (mime, name, content) in files {
++        attachments.push(name.clone());
++        builder = builder.attachment(mime, name, content);
++    }
++    let raw = builder
++        .write_to_vec()
++        .map_err(|e| format!("Build message: {e}"))?;
++    Ok(BuiltDraft {
++        raw,
++        message_id,
++        subject,
++        to,
++        attachments,
++    })
++}
++
++/// APPEND `raw` to the Drafts folder (or `folder`, a name from list_folders)
++/// with `\Draft \Seen`. Returns the folder name as shown to users.
++pub async fn append_draft(
++    account_id: u64,
++    folder: Option<&str>,
++    raw: &[u8],
++) -> Result<String, String> {
++    let mut session = ImapExecutor::create_connection(account_id)
++        .await
++        .map_err(|e| format!("IMAP connection: {e:#}"))?;
++    let (folder_raw, folder_shown) = match folder {
++        Some(name) => {
++            let mailbox = MailBox::list_all(account_id)
++                .map_err(|e| format!("Folders: {e:#}"))?
++                .into_iter()
++                .find(|m| m.name == name)
++                .ok_or_else(|| format!("Folder {name:?} is not known for this account"))?;
++            (mailbox.encoded_name(), mailbox.name)
++        }
++        None => {
++            let names = ImapExecutor::list_all_mailboxes(&mut session)
++                .await
++                .map_err(|e| format!("IMAP LIST: {e:#}"))?;
++            let drafts = names
++                .iter()
++                .find(|n| {
++                    n.attributes()
++                        .iter()
++                        .any(|a| Attribute::from(a).attr == AttributeEnum::Drafts)
++                })
++                .map(|n| n.name().to_string())
++                .ok_or("The server marks no folder as \\Drafts; give `folder` explicitly")?;
++            let shown = MailBox::list_all(account_id)
++                .ok()
++                .and_then(|list| list.into_iter().find(|m| m.encoded_name() == drafts))
++                .map(|m| m.name)
++                .unwrap_or_else(|| drafts.clone());
++            (drafts, shown)
++        }
++    };
++    ImapExecutor::append(
++        &mut session,
++        &folder_raw,
++        Some("(\\Draft \\Seen)"),
++        None,
++        raw,
++    )
++    .await
++    .map_err(|e| format!("IMAP APPEND to {folder_shown}: {e:#}"))?;
++    let _ = session.logout().await;
++    Ok(folder_shown)
++}
++
++/// Build the draft and append it to the Drafts folder. Permission checks
++/// (draft permission, read access to the replied message) are the caller's.
++pub async fn save_draft(req: DraftRequest) -> Result<DraftSaved, String> {
++    let account = AccountModel::check_account_exists(req.account_id)
++        .map_err(|e| format!("Account {}: {e:#}", req.account_id))?;
++    if !matches!(account.account_type, AccountType::IMAP) {
++        return Err("Drafts are only supported for IMAP accounts".into());
++    }
++    let reply = match &req.reply_to_envelope_id {
++        Some(id) => {
++            let (_, eml) = reattach_eml_content(req.account_id, id.clone())
++                .map_err(|e| format!("Original message: {e:#}"))?;
++            Some(reply_context(&eml)?)
++        }
++        None => None,
++    };
++    let files = read_attachments(&req.attachments)?;
++    let built = build_draft(
++        &account.email,
++        account.account_name.as_deref(),
++        &req,
++        reply.as_ref(),
++        files,
++    )?;
++    let folder = append_draft(req.account_id, req.folder.as_deref(), &built.raw).await?;
++    tracing::info!(
++        account_id = req.account_id,
++        folder = %folder,
++        message_id = %built.message_id,
++        "MCP draft saved"
++    );
++    Ok(DraftSaved {
++        account: account.email,
++        folder,
++        message_id: built.message_id,
++        subject: built.subject,
++        to: built.to,
++        attachments: built.attachments,
++        size: built.raw.len(),
++    })
++}
+diff --git a/crates/server/src/mcp/files.rs b/crates/server/src/mcp/files.rs
+new file mode 100644
+index 0000000..1ae64b3
+--- /dev/null
++++ b/crates/server/src/mcp/files.rs
+@@ -0,0 +1,101 @@
++//
++// Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
++//
++// This file is part of the Bichon Email Archiving Project
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++//! The MCP file exchange directory (`BICHON_MCP_FILES_DIR`): the only place
++//! the MCP tools write to or read from on the local file system.
++
++use std::path::{Path, PathBuf};
++
++use super::MCP_SETTINGS;
++
++/// Draft attachments larger than this are refused (most providers cap a
++/// message at 25 MB, and base64 grows it by a third).
++pub const MAX_DRAFT_ATTACHMENTS_BYTES: u64 = 18 * 1024 * 1024;
++
++fn files_dir() -> Result<PathBuf, String> {
++    let dir = MCP_SETTINGS
++        .files_dir
++        .as_ref()
++        .ok_or("File exchange is not configured (BICHON_MCP_FILES_DIR is not set)")?;
++    dir.canonicalize()
++        .map_err(|e| format!("File exchange directory {}: {e}", dir.display()))
++}
++
++/// A file name safe to create: no path separators, control characters or
++/// leading dots, at most 150 characters.
++pub fn safe_file_name(name: &str) -> String {
++    let cleaned: String = name
++        .chars()
++        .map(|c| match c {
++            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
++            c if c.is_control() => '_',
++            c => c,
++        })
++        .collect();
++    let cleaned = cleaned.trim().trim_start_matches('.').trim();
++    let cleaned: String = cleaned.chars().take(150).collect();
++    if cleaned.is_empty() {
++        "attachment".to_string()
++    } else {
++        cleaned
++    }
++}
++
++/// Write `content` to `<files dir>/<subdir>/<name>` through a temporary file
++/// and a rename, so that a reader (or a file sync) never sees a partial file.
++/// An existing file with the same name is replaced.
++pub fn save(subdir: &[&str], name: &str, content: &[u8]) -> Result<PathBuf, String> {
++    let mut dir = files_dir()?;
++    for part in subdir {
++        dir.push(safe_file_name(part));
++    }
++    std::fs::create_dir_all(&dir).map_err(|e| format!("Create {}: {e}", dir.display()))?;
++    let target = dir.join(safe_file_name(name));
++    let tmp = dir.join(format!(".{}.part", uuid::Uuid::new_v4()));
++    std::fs::write(&tmp, content).map_err(|e| format!("Write {}: {e}", tmp.display()))?;
++    std::fs::rename(&tmp, &target).map_err(|e| {
++        let _ = std::fs::remove_file(&tmp);
++        format!("Rename to {}: {e}", target.display())
++    })?;
++    Ok(target)
++}
++
++/// Resolve a path given by the agent to a regular file inside the files
++/// directory (symlinks resolved first, so they cannot point outside).
++pub fn resolve_input(path: &str) -> Result<PathBuf, String> {
++    let dir = files_dir()?;
++    let given = Path::new(path);
++    let full = if given.is_absolute() {
++        given.to_path_buf()
++    } else {
++        dir.join(given)
++    };
++    let real = full
++        .canonicalize()
++        .map_err(|e| format!("Attachment {path}: {e}"))?;
++    if !real.starts_with(&dir) {
++        return Err(format!(
++            "Attachment {path} is outside the file exchange directory {}",
++            dir.display()
++        ));
++    }
++    if !real.is_file() {
++        return Err(format!("Attachment {path} is not a regular file"));
++    }
++    Ok(real)
++}
+diff --git a/crates/server/src/mcp/mod.rs b/crates/server/src/mcp/mod.rs
+new file mode 100644
+index 0000000..24cd564
+--- /dev/null
++++ b/crates/server/src/mcp/mod.rs
+@@ -0,0 +1,100 @@
++//
++// Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
++//
++// This file is part of the Bichon Email Archiving Project
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++//! MCP (Model Context Protocol) endpoint for AI agents (svesh fork).
++//!
++//! Based on upstream's unfinished `feature/add-mcp` branch (602bc22), ported to
++//! 2.x and extended with on-demand sync, attachment export and IMAP drafts.
++//! Configured by its own environment variables so the upstream settings stay
++//! untouched:
++//!
++//! - `BICHON_ENABLE_MCP=true` mounts `/mcp` (behind `ApiGuard`).
++//! - `BICHON_MCP_FILES_DIR=/path` is the file exchange directory: attachments
++//!   are saved under it, and draft attachments may only be read from it.
++
++use std::{path::PathBuf, sync::Arc, sync::LazyLock};
++
++use bichon_core::common::auth::ClientContext;
++use poem::{http::StatusCode, Body, Endpoint, EndpointExt, IntoResponse, Request, Response};
++use poem_mcpserver::{streamable_http, McpServer};
++
++mod draft;
++mod files;
++#[cfg(test)]
++mod tests;
++mod tools;
++use tools::BichonMcpTools;
++
++pub struct McpSettings {
++    pub enabled: bool,
++    pub files_dir: Option<PathBuf>,
++}
++
++pub static MCP_SETTINGS: LazyLock<McpSettings> = LazyLock::new(|| McpSettings {
++    enabled: std::env::var("BICHON_ENABLE_MCP")
++        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
++        .unwrap_or(false),
++    files_dir: std::env::var_os("BICHON_MCP_FILES_DIR")
++        .filter(|v| !v.is_empty())
++        .map(PathBuf::from),
++});
++
++/// Create a Poem endpoint that handles MCP Streamable HTTP requests.
++///
++/// The endpoint requires authentication via `ApiGuard` middleware (applied at
++/// the route level in `rest/mod.rs`). The guard stores the `ClientContext` in
++/// the request data; every tool checks the caller's permissions with it.
++pub fn mcp_endpoint() -> impl poem::IntoEndpoint {
++    streamable_http::endpoint(|req: &Request| {
++        let ctx = req
++            .data::<Arc<ClientContext>>()
++            .expect("ApiGuard middleware must provide ClientContext in request data")
++            .as_ref()
++            .clone();
++        McpServer::new()
++            .with_server_info("bichon-mcp", env!("CARGO_PKG_VERSION"))
++            .tools(BichonMcpTools::new(ctx))
++    })
++    .around(unbatch)
++}
++
++/// poem-mcpserver answers every JSON POST with an array, also for a single
++/// request and for notifications (`[]`). MCP 2025-06-18 has no batches: a
++/// request gets one response object, a notification `202 Accepted`.
++async fn unbatch<E: Endpoint>(ep: Arc<E>, req: Request) -> poem::Result<Response> {
++    let resp = ep.call(req).await?.into_response();
++    let is_json = resp
++        .content_type()
++        .is_some_and(|ct| ct.starts_with("application/json"));
++    if !is_json || !resp.status().is_success() {
++        return Ok(resp);
++    }
++    let (mut parts, body) = resp.into_parts();
++    let bytes = body.into_bytes().await?;
++    let bytes = match serde_json::from_slice::<serde_json::Value>(&bytes) {
++        Ok(serde_json::Value::Array(items)) if items.is_empty() => {
++            return Ok(Response::builder().status(StatusCode::ACCEPTED).finish());
++        }
++        Ok(serde_json::Value::Array(mut items)) if items.len() == 1 => {
++            serde_json::to_vec(&items.remove(0)).unwrap_or_default()
++        }
++        _ => bytes.to_vec(),
++    };
++    parts.headers.remove(http::header::CONTENT_LENGTH);
++    Ok(Response::from_parts(parts, Body::from(bytes)))
++}
+diff --git a/crates/server/src/mcp/tests.rs b/crates/server/src/mcp/tests.rs
+new file mode 100644
+index 0000000..d72b84a
+--- /dev/null
++++ b/crates/server/src/mcp/tests.rs
+@@ -0,0 +1,1028 @@
++//
++// Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
++//
++// This file is part of the Bichon Email Archiving Project
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++//! Tests of the MCP module: pure helpers, the tools against a real (temporary)
++//! store with imported messages, the HTTP endpoint, and drafts against a tiny
++//! scripted IMAP server.
++
++use std::{
++    path::PathBuf,
++    sync::{Arc, Mutex},
++    time::Duration,
++};
++
++use base64::Engine;
++use bichon_core::{
++    archive::imap::mailbox::MailBox,
++    common::auth::ClientContext,
++    import::{BatchEmlRequest, ImportEmls},
++    store::tantivy::{attachment::ATTACHMENT_MANAGER, envelope::ENVELOPE_MANAGER},
++    users::{UserModel, DEFAULT_ADMIN_USER_ID},
++};
++use mail_parser::{MessageParser, MimeHeaders};
++use poem::{
++    endpoint::make_sync, http::StatusCode, test::TestClient, web::Json as PoemJson, EndpointExt,
++    IntoResponse, Response, Route,
++};
++use serde_json::{json, Value};
++use tokio::{
++    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
++    net::TcpListener,
++    sync::OnceCell,
++};
++
++use super::{
++    draft::{
++        append_draft, build_draft, read_attachments, reply_context, reply_subject, save_draft,
++        DraftRequest, ReplyContext,
++    },
++    files::{resolve_input, safe_file_name, save},
++    mcp_endpoint,
++    tools::{format_ms, parse_date, BichonMcpTools},
++    unbatch, MCP_SETTINGS,
++};
++use crate::common::auth::ApiGuard;
++
++// ── Fixtures ────────────────────────────────────────────────────────────────
++
++const ORIGINAL: &str = "Message-ID: <orig-1@example.org>\r\n\
++From: Alice <alice@example.org>\r\n\
++Reply-To: Alice Desk <desk@example.org>\r\n\
++To: archive@example.com\r\n\
++Subject: =?UTF-8?B?0JDQutGCINC30LAg0L7QutGC0Y/QsdGA0Yw=?=\r\n\
++Date: Tue, 06 Oct 2026 10:00:00 +0000\r\n\
++MIME-Version: 1.0\r\n\
++Content-Type: multipart/mixed; boundary=\"b1\"\r\n\
++\r\n\
++--b1\r\n\
++Content-Type: text/plain; charset=utf-8\r\n\
++\r\n\
++Akt attached, zebra-marker\r\n\
++--b1\r\n\
++Content-Type: application/pdf\r\n\
++Content-Disposition: attachment; filename=\"akt.pdf\"\r\n\
++Content-Transfer-Encoding: base64\r\n\
++\r\n\
++UERGREFUQQ==\r\n\
++--b1--\r\n";
++
++const REPLY: &str = "Message-ID: <orig-2@example.org>\r\n\
++In-Reply-To: <orig-1@example.org>\r\n\
++References: <orig-1@example.org>\r\n\
++From: archive@example.com\r\n\
++To: Alice <alice@example.org>\r\n\
++Cc: boss@example.org\r\n\
++Subject: Re: =?UTF-8?B?0JDQutGCINC30LAg0L7QutGC0Y/QsdGA0Yw=?=\r\n\
++Date: Wed, 07 Oct 2026 10:00:00 +0000\r\n\
++MIME-Version: 1.0\r\n\
++Content-Type: text/html; charset=utf-8\r\n\
++\r\n\
++<p>Thanks, got it</p>\r\n";
++
++struct Fixture {
++    archive_id: u64,
++    original_id: String,
++    reply_id: String,
++    thread_id: String,
++}
++
++static FIXTURE: OnceCell<Fixture> = OnceCell::const_new();
++
++fn files_root() -> PathBuf {
++    std::env::temp_dir().join(format!("bichon-mcp-files-{}", std::process::id()))
++}
++
++/// The MCP file directory, set before `MCP_SETTINGS` is first read.
++fn files_env() {
++    static ENV: std::sync::Once = std::sync::Once::new();
++    ENV.call_once(|| {
++        std::fs::create_dir_all(files_root()).unwrap();
++        std::env::set_var("BICHON_MCP_FILES_DIR", files_root());
++        std::env::set_var("BICHON_ENABLE_MCP", "true");
++    });
++}
++
++/// The shared server setup. Only `store_scenarios` calls it: the index
++/// writer runs as a task of the runtime that first starts the store, so every
++/// test that needs the index runs inside that one test.
++async fn setup() {
++    files_env();
++    crate::tests::setup().await;
++}
++
++fn admin() -> ClientContext {
++    ClientContext {
++        ip_addr: None,
++        user: UserModel::find(DEFAULT_ADMIN_USER_ID).unwrap().unwrap(),
++    }
++}
++
++/// A logged-in user without any role.
++fn nobody() -> ClientContext {
++    let mut user = UserModel::find(DEFAULT_ADMIN_USER_ID).unwrap().unwrap();
++    user.global_roles = Default::default();
++    user.account_access_map = Default::default();
++    ClientContext {
++        ip_addr: None,
++        user,
++    }
++}
++
++fn api() -> TestClient<impl poem::Endpoint> {
++    TestClient::new(crate::tests::build_api_route()).default_header("X-Forwarded-For", "127.0.0.1")
++}
++
++async fn create_account(body: Value) -> u64 {
++    let token = crate::tests::admin_token().await;
++    let resp = api()
++        .post("/api/v1/account")
++        .header("Authorization", format!("Bearer {token}"))
++        .body_json(&body)
++        .send()
++        .await;
++    if !resp.0.status().is_success() {
++        let status = resp.0.status();
++        panic!(
++            "create account: {status} {}",
++            resp.0.into_body().into_string().await.unwrap()
++        );
++    }
++    resp.json().await.value().object().get("id").i64() as u64
++}
++
++fn b64(eml: &str) -> String {
++    // The import API takes URL-safe base64.
++    base64::engine::general_purpose::URL_SAFE.encode(eml)
++}
++
++async fn search_ids(ctx: &ClientContext, text: Option<&str>, account: Option<u64>) -> Vec<Value> {
++    let page = BichonMcpTools::new(ctx.clone())
++        .search_emails(
++            text.map(Into::into),
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++            account.map(|id| vec![id]),
++            None,
++            None,
++            None,
++            None,
++            None,
++        )
++        .await
++        .unwrap();
++    serde_json::to_value(page.0).unwrap()["messages"]
++        .as_array()
++        .unwrap()
++        .clone()
++}
++
++/// A local archive account with the two messages above, searchable.
++async fn fixture() -> &'static Fixture {
++    FIXTURE
++        .get_or_init(|| async {
++            setup().await;
++            let archive_id = create_account(json!({
++                "email": "archive@example.com",
++                "enabled": true,
++                "account_type": "NoSync",
++                "use_dangerous": false,
++                "account_name": "Archive"
++            }))
++            .await;
++            let result = ImportEmls::do_import(BatchEmlRequest {
++                account_id: archive_id,
++                mail_folder: "INBOX".into(),
++                emls: vec![b64(ORIGINAL), b64(REPLY)],
++            })
++            .await
++            .unwrap();
++            assert_eq!(result.success, 2, "{result:?}");
++            // The index commits once a minute: force it, then wait for the reader.
++            ENVELOPE_MANAGER.prepare_for_backup().await.unwrap();
++            ATTACHMENT_MANAGER.prepare_for_backup().await.unwrap();
++            let ctx = admin();
++            let mut found = Vec::new();
++            for _ in 0..100 {
++                found = search_ids(&ctx, None, Some(archive_id)).await;
++                if found.len() >= 2 {
++                    break;
++                }
++                tokio::time::sleep(Duration::from_millis(200)).await;
++            }
++            let by_subject = |prefix: &str| {
++                found
++                    .iter()
++                    .find(|m| m["subject"].as_str().unwrap().starts_with(prefix))
++                    .unwrap_or_else(|| panic!("no message {prefix:?} in {found:?}"))
++                    .clone()
++            };
++            let original = by_subject("Акт");
++            let reply = by_subject("Re:");
++            Fixture {
++                archive_id,
++                original_id: original["envelope_id"].as_str().unwrap().into(),
++                reply_id: reply["envelope_id"].as_str().unwrap().into(),
++                thread_id: original["thread_id"].as_str().unwrap().into(),
++            }
++        })
++        .await
++}
++
++// ── Scripted IMAP server ────────────────────────────────────────────────────
++
++type Appended = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
++
++/// Answers what Bichon sends for login, LIST, EXAMINE, SEARCH and APPEND;
++/// records appended messages. `drafts`: whether a folder carries `\Drafts`.
++async fn mock_imap(drafts: bool) -> (u16, Appended) {
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let port = listener.local_addr().unwrap().port();
++    let appended: Appended = Default::default();
++    let store = appended.clone();
++    tokio::spawn(async move {
++        while let Ok((stream, _)) = listener.accept().await {
++            let store = store.clone();
++            tokio::spawn(async move {
++                let _ = imap_session(stream, drafts, store).await;
++            });
++        }
++    });
++    (port, appended)
++}
++
++async fn imap_session(
++    stream: tokio::net::TcpStream,
++    drafts: bool,
++    store: Appended,
++) -> std::io::Result<()> {
++    let (read, mut write) = stream.into_split();
++    let mut read = BufReader::new(read);
++    write
++        .write_all(b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN] mock ready\r\n")
++        .await?;
++    let mut line = String::new();
++    loop {
++        line.clear();
++        if read.read_line(&mut line).await? == 0 {
++            return Ok(());
++        }
++        let mut words = line.trim_end().splitn(3, ' ');
++        let tag = words.next().unwrap_or("*").to_string();
++        let mut command = words.next().unwrap_or("").to_ascii_uppercase();
++        let mut rest = words.next().unwrap_or("").to_string();
++        if command == "UID" {
++            let mut sub = rest.splitn(2, ' ');
++            command = sub.next().unwrap_or("").to_ascii_uppercase();
++            rest = sub.next().unwrap_or("").to_string();
++        }
++        let reply = match command.as_str() {
++            "CAPABILITY" => "* CAPABILITY IMAP4rev1 AUTH=PLAIN ID\r\n".to_string(),
++            "AUTHENTICATE" => {
++                write.write_all(b"+ \r\n").await?;
++                let mut ignored = String::new();
++                read.read_line(&mut ignored).await?;
++                String::new()
++            }
++            "LIST" => {
++                let drafts_attr = if drafts { " \\Drafts" } else { "" };
++                format!(
++                    "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n\
++                     * LIST (\\HasNoChildren{drafts_attr}) \"/\" \"Drafts\"\r\n"
++                )
++            }
++            "SELECT" | "EXAMINE" => "* 0 EXISTS\r\n* 0 RECENT\r\n* FLAGS (\\Seen \\Draft)\r\n\
++                 * OK [UIDVALIDITY 1] ok\r\n* OK [UIDNEXT 1] ok\r\n"
++                .to_string(),
++            "SEARCH" => "* SEARCH\r\n".to_string(),
++            "STATUS" => {
++                "* STATUS \"INBOX\" (MESSAGES 0 UIDNEXT 1 UIDVALIDITY 1 UNSEEN 0)\r\n".to_string()
++            }
++            "APPEND" => {
++                // APPEND <mailbox> (<flags>) {<n>} or {<n>+}
++                let mailbox = rest
++                    .split(' ')
++                    .next()
++                    .unwrap_or("")
++                    .trim_matches('"')
++                    .to_string();
++                let flags = rest
++                    .find('(')
++                    .and_then(|start| {
++                        rest[start..]
++                            .find(')')
++                            .map(|end| &rest[start..=start + end])
++                    })
++                    .unwrap_or("")
++                    .to_string();
++                let size_spec = &rest[rest.rfind('{').unwrap() + 1..rest.rfind('}').unwrap()];
++                let synchronizing = !size_spec.ends_with('+');
++                let size: usize = size_spec.trim_end_matches('+').parse().unwrap();
++                if synchronizing {
++                    write.write_all(b"+ go ahead\r\n").await?;
++                }
++                let mut body = vec![0u8; size];
++                read.read_exact(&mut body).await?;
++                let mut end = String::new();
++                read.read_line(&mut end).await?;
++                store.lock().unwrap().push((mailbox, flags, body));
++                String::new()
++            }
++            "LOGOUT" => {
++                write
++                    .write_all(format!("* BYE\r\n{tag} OK bye\r\n").as_bytes())
++                    .await?;
++                return Ok(());
++            }
++            _ => String::new(),
++        };
++        write
++            .write_all(format!("{reply}{tag} OK done\r\n").as_bytes())
++            .await?;
++    }
++}
++
++async fn imap_account(email: &str, drafts: bool) -> (u64, Appended) {
++    setup().await;
++    let (port, appended) = mock_imap(drafts).await;
++    let id = create_account(json!({
++        "email": email,
++        "enabled": true,
++        "account_type": "IMAP",
++        "use_dangerous": false,
++        "account_name": "Draft Tester",
++        "download_interval_min": 600,
++        "imap": {
++            "host": "127.0.0.1",
++            "port": port,
++            "encryption": "None",
++            "auth": {"auth_type": "Password", "password": "secret"}
++        }
++    }))
++    .await;
++    (id, appended)
++}
++
++// ── Pure helpers ────────────────────────────────────────────────────────────
++
++#[test]
++fn reply_subject_adds_prefix_once() {
++    assert_eq!(reply_subject("Акт за октябрь"), "Re: Акт за октябрь");
++    assert_eq!(reply_subject("RE: Акт"), "RE: Акт");
++    assert_eq!(reply_subject("Re[2]: Акт"), "Re[2]: Акт");
++}
++
++#[test]
++fn parse_date_accepts_day_and_rfc3339() {
++    assert_eq!(parse_date("1970-01-02").unwrap(), 86_400_000);
++    assert_eq!(parse_date(" 1970-01-01T00:00:01Z ").unwrap(), 1000);
++    assert!(parse_date("01.02.2026").is_err());
++}
++
++#[test]
++fn format_ms_is_rfc3339_or_empty() {
++    assert_eq!(format_ms(0), "1970-01-01T00:00:00+00:00");
++    assert_eq!(format_ms(i64::MAX), "");
++}
++
++#[test]
++fn safe_file_name_strips_paths_and_controls() {
++    assert_eq!(safe_file_name("../../etc/passwd"), "_.._etc_passwd");
++    assert_eq!(safe_file_name("..hidden"), "hidden");
++    assert_eq!(safe_file_name("a:b*c?\u{7}.pdf"), "a_b_c__.pdf");
++    assert_eq!(safe_file_name("   "), "attachment");
++    assert_eq!(safe_file_name(&"я".repeat(200)).chars().count(), 150);
++}
++
++#[test]
++fn reply_context_reads_threading_headers() {
++    let ctx = reply_context(REPLY.as_bytes()).unwrap();
++    assert_eq!(ctx.message_id.as_deref(), Some("orig-2@example.org"));
++    assert_eq!(ctx.references, ["orig-1@example.org", "orig-2@example.org"]);
++    assert_eq!(ctx.reply_to, ["archive@example.com"]);
++    let long =
++        reply_context(b"Message-ID: <c@x>\r\nReferences: <a@x> <b@x>\r\nFrom: f@x\r\n\r\nbody")
++            .unwrap();
++    assert_eq!(long.references, ["a@x", "b@x", "c@x"]);
++    assert!(ctx.subject.starts_with("Re: Акт"));
++
++    let original = reply_context(ORIGINAL.as_bytes()).unwrap();
++    assert_eq!(
++        original.reply_to,
++        ["desk@example.org"],
++        "Reply-To wins over From"
++    );
++    assert_eq!(original.references, ["orig-1@example.org"]);
++
++    let bare = reply_context(b"Subject: x\r\n\r\nbody").unwrap();
++    assert!(bare.message_id.is_none() && bare.references.is_empty() && bare.reply_to.is_empty());
++    assert!(reply_context(b"").is_err());
++}
++
++fn parse(raw: &[u8]) -> mail_parser::Message<'_> {
++    MessageParser::default().parse(raw).unwrap()
++}
++
++#[test]
++fn build_draft_reply_sets_threading_and_defaults() {
++    let reply = ReplyContext {
++        message_id: Some("orig-1@example.org".into()),
++        references: vec!["orig-0@example.org".into(), "orig-1@example.org".into()],
++        subject: "Акт".into(),
++        reply_to: vec!["alice@example.org".into()],
++    };
++    let req = DraftRequest {
++        cc: vec!["cc@example.org".into()],
++        bcc: vec!["bcc@example.org".into()],
++        text: Some("Спасибо".into()),
++        html: Some("<p>Спасибо</p>".into()),
++        ..Default::default()
++    };
++    let files = vec![("application/pdf".into(), "akt.pdf".into(), b"PDF".to_vec())];
++    let built = build_draft("me@example.com", Some("Me"), &req, Some(&reply), files).unwrap();
++    assert_eq!(built.to, ["alice@example.org"]);
++    assert_eq!(built.subject, "Re: Акт");
++    assert_eq!(built.attachments, ["akt.pdf"]);
++    assert!(built.message_id.ends_with("@example.com"));
++
++    let msg = parse(&built.raw);
++    assert_eq!(msg.subject(), Some("Re: Акт"));
++    assert_eq!(msg.in_reply_to().as_text(), Some("orig-1@example.org"));
++    assert_eq!(msg.message_id(), Some(built.message_id.as_str()));
++    let from = msg.from().unwrap().first().unwrap();
++    assert_eq!(from.name(), Some("Me"));
++    assert_eq!(from.address(), Some("me@example.com"));
++    assert_eq!(
++        msg.cc().unwrap().first().unwrap().address(),
++        Some("cc@example.org")
++    );
++    assert_eq!(msg.body_text(0).as_deref(), Some("Спасибо"));
++    assert_eq!(
++        msg.attachment(0).unwrap().attachment_name(),
++        Some("akt.pdf")
++    );
++}
++
++#[test]
++fn build_draft_new_message_and_errors() {
++    let req = DraftRequest {
++        to: vec!["x@example.org".into()],
++        subject: Some("Hello".into()),
++        text: Some("Hi".into()),
++        ..Default::default()
++    };
++    let built = build_draft("me@example.com", Some("  "), &req, None, vec![]).unwrap();
++    let msg = parse(&built.raw);
++    assert_eq!(
++        msg.from().unwrap().first().unwrap().name(),
++        None,
++        "blank name is dropped"
++    );
++    assert!(msg.in_reply_to().is_empty());
++    let built = build_draft("me@example.com", None, &req, None, vec![]).unwrap();
++    assert_eq!(built.subject, "Hello");
++
++    let no_to = DraftRequest {
++        to: vec![],
++        ..DraftRequest {
++            subject: Some("s".into()),
++            text: Some("t".into()),
++            ..Default::default()
++        }
++    };
++    assert!(build_draft("me@example.com", None, &no_to, None, vec![])
++        .unwrap_err()
++        .contains("No recipients"));
++    let no_subject = DraftRequest {
++        to: vec!["x@example.org".into()],
++        text: Some("t".into()),
++        ..Default::default()
++    };
++    assert!(
++        build_draft("me@example.com", None, &no_subject, None, vec![])
++            .unwrap_err()
++            .contains("No subject")
++    );
++    let no_body = DraftRequest {
++        to: vec!["x@example.org".into()],
++        subject: Some("s".into()),
++        ..Default::default()
++    };
++    assert!(build_draft("me@example.com", None, &no_body, None, vec![])
++        .unwrap_err()
++        .contains("No body"));
++}
++
++// ── File exchange directory ─────────────────────────────────────────────────
++
++#[test]
++fn files_save_and_resolve_stay_inside_the_directory() {
++    files_env();
++    assert!(MCP_SETTINGS.enabled);
++    let path = save(&["t", "a/b"], "../report.pdf", b"data").unwrap();
++    let root = files_root().canonicalize().unwrap();
++    assert!(path.starts_with(&root));
++    assert_eq!(path.file_name().unwrap(), "_report.pdf");
++    assert_eq!(std::fs::read(&path).unwrap(), b"data");
++    let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
++        .unwrap()
++        .filter_map(|e| e.ok())
++        .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
++        .collect();
++    assert!(leftovers.is_empty());
++
++    // Relative and absolute paths inside are fine.
++    assert_eq!(resolve_input("t/a_b/_report.pdf").unwrap(), path);
++    assert_eq!(resolve_input(path.to_str().unwrap()).unwrap(), path);
++    // Outside, directories, missing files and symlinks out are refused.
++    assert!(resolve_input("/etc/hostname")
++        .unwrap_err()
++        .contains("outside"));
++    assert!(resolve_input("t")
++        .unwrap_err()
++        .contains("not a regular file"));
++    assert!(resolve_input("t/missing.pdf").is_err());
++    let link = root.join("t/escape");
++    let _ = std::fs::remove_file(&link);
++    std::os::unix::fs::symlink("/etc/hostname", &link).unwrap();
++    assert!(resolve_input("t/escape").unwrap_err().contains("outside"));
++    // A target that cannot be written: a directory in the way of the file.
++    std::fs::create_dir_all(root.join("t/blocked/name")).unwrap();
++    assert!(save(&["t", "blocked"], "name", b"x")
++        .unwrap_err()
++        .contains("Rename"));
++}
++
++#[test]
++fn read_attachments_guesses_types_and_caps_size() {
++    files_env();
++    let pdf = save(&["att"], "doc.pdf", b"%PDF").unwrap();
++    let odd = save(&["att"], "blob.zzzunknown", b"?").unwrap();
++    let files = read_attachments(&[pdf.display().to_string(), odd.display().to_string()]).unwrap();
++    assert_eq!(files[0].0, "application/pdf");
++    assert_eq!(files[0].1, "doc.pdf");
++    assert_eq!(files[1].0, "application/octet-stream");
++
++    let big = save(&["att"], "big.bin", &vec![0u8; 19 * 1024 * 1024]).unwrap();
++    assert!(read_attachments(&[big.display().to_string()])
++        .unwrap_err()
++        .contains("exceed"));
++    assert!(read_attachments(&["/etc/hostname".into()]).is_err());
++}
++
++// ── unbatch ─────────────────────────────────────────────────────────────────
++
++async fn through_unbatch(resp: Response) -> (StatusCode, String) {
++    let resp = Arc::new(Mutex::new(Some(resp)));
++    let ep = make_sync(move |_| resp.lock().unwrap().take().unwrap()).around(unbatch);
++    let out = TestClient::new(ep).post("/").send().await;
++    let status = out.0.status();
++    (status, out.0.into_body().into_string().await.unwrap())
++}
++
++#[tokio::test]
++async fn unbatch_normalizes_single_responses() {
++    let json = |v: Value| PoemJson(v).into_response();
++    assert_eq!(
++        through_unbatch(json(json!([]))).await,
++        (StatusCode::ACCEPTED, String::new())
++    );
++    assert_eq!(
++        through_unbatch(json(json!([{"id": 1}]))).await,
++        (StatusCode::OK, r#"{"id":1}"#.into())
++    );
++    assert_eq!(through_unbatch(json(json!([1, 2]))).await.1, "[1,2]");
++    assert_eq!(through_unbatch("plain".into_response()).await.1, "plain");
++    let failed = PoemJson(json!([]))
++        .with_status(StatusCode::BAD_REQUEST)
++        .into_response();
++    assert_eq!(through_unbatch(failed).await.0, StatusCode::BAD_REQUEST);
++    let broken = "[oops"
++        .with_content_type("application/json")
++        .into_response();
++    assert_eq!(through_unbatch(broken).await.1, "[oops");
++}
++
++// ── Tools against the store ─────────────────────────────────────────────────
++
++#[tokio::test(flavor = "multi_thread")]
++async fn store_scenarios() {
++    fixture().await;
++    list_accounts_and_folders().await;
++    search_filters_and_errors().await;
++    get_email_and_thread().await;
++    save_attachments_writes_files().await;
++    save_draft_appends_to_drafts_folder().await;
++    save_draft_explicit_folder_and_errors().await;
++    sync_now_runs_and_checks_rights().await;
++    endpoint_speaks_mcp_behind_the_token_guard().await;
++}
++
++async fn list_accounts_and_folders() {
++    let fx = fixture().await;
++    let tools = BichonMcpTools::new(admin());
++    let accounts = serde_json::to_value(tools.list_accounts().await.unwrap().0).unwrap();
++    assert!(accounts
++        .as_array()
++        .unwrap()
++        .iter()
++        .any(|a| a["account_id"] == fx.archive_id && a["email"] == "archive@example.com"));
++    let folders = serde_json::to_value(tools.list_folders(fx.archive_id).await.unwrap().0).unwrap();
++    assert!(folders
++        .as_array()
++        .unwrap()
++        .iter()
++        .any(|f| f["name"] == "INBOX"));
++
++    let nobody = BichonMcpTools::new(nobody());
++    let visible = nobody.list_accounts().await.unwrap().0;
++    assert!(visible.is_empty());
++    assert!(nobody
++        .list_folders(fx.archive_id)
++        .await
++        .unwrap_err()
++        .contains("Permission"));
++}
++
++async fn search_filters_and_errors() {
++    let fx = fixture().await;
++    let tools = BichonMcpTools::new(admin());
++    let hits = search_ids(&admin(), Some("zebra"), Some(fx.archive_id)).await;
++    assert_eq!(hits.len(), 1);
++    assert_eq!(hits[0]["envelope_id"], fx.original_id.as_str());
++    assert_eq!(hits[0]["attachments"], 1);
++
++    let page = tools
++        .search_emails(
++            None,
++            None,
++            Some("alice".into()),
++            None,
++            Some("alice@example.org".into()),
++            Some("2026-10-01".into()),
++            Some("2026-10-07T00:00:00Z".into()),
++            Some(vec![fx.archive_id]),
++            None,
++            Some(true),
++            Some("akt".into()),
++            Some(1),
++            Some(500),
++        )
++        .await
++        .unwrap();
++    let page = serde_json::to_value(page.0).unwrap();
++    assert_eq!(page["total"], 1, "{page}");
++    assert_eq!(page["page"], 1);
++
++    let bad = tools
++        .search_emails(
++            None,
++            None,
++            None,
++            None,
++            None,
++            Some("yesterday".into()),
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++        )
++        .await;
++    assert!(bad.unwrap_err().contains("Bad date"));
++    let bad = tools
++        .search_emails(
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++            Some("tomorrow".into()),
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++        )
++        .await;
++    assert!(bad.unwrap_err().contains("Bad date"));
++}
++
++async fn get_email_and_thread() {
++    let fx = fixture().await;
++    let tools = BichonMcpTools::new(admin());
++    let email = tools
++        .get_email(fx.archive_id, format!(" {} ", fx.original_id), None)
++        .await
++        .unwrap();
++    let email = serde_json::to_value(email.0).unwrap();
++    assert!(email["text"].as_str().unwrap().contains("zebra-marker"));
++    assert!(email.get("html").is_none());
++    assert_eq!(email["attachments"][0]["filename"], "akt.pdf");
++    assert_eq!(email["thread_id"], fx.thread_id.as_str());
++
++    // HTML-only message: text is converted from the HTML; HTML on request.
++    let reply = tools
++        .get_email(fx.archive_id, fx.reply_id.clone(), None)
++        .await
++        .unwrap();
++    let reply = serde_json::to_value(reply.0).unwrap();
++    assert!(reply["text"].as_str().unwrap().contains("Thanks"));
++    assert!(reply.get("html").is_none());
++    assert_eq!(reply["cc"][0], "boss@example.org");
++    let reply = tools
++        .get_email(fx.archive_id, fx.reply_id.clone(), Some(true))
++        .await
++        .unwrap();
++    let reply = serde_json::to_value(reply.0).unwrap();
++    assert!(reply["html"].as_str().unwrap().contains("<p>Thanks"));
++
++    let thread = tools
++        .get_thread(fx.archive_id, fx.thread_id.clone(), None, None)
++        .await
++        .unwrap();
++    assert_eq!(serde_json::to_value(thread.0).unwrap()["total"], 2);
++
++    assert!(tools
++        .get_email(fx.archive_id, "nope".into(), Some(true))
++        .await
++        .is_err());
++    let nobody = BichonMcpTools::new(nobody());
++    assert!(nobody
++        .get_email(fx.archive_id, fx.original_id.clone(), None)
++        .await
++        .is_err());
++    assert!(nobody
++        .get_thread(fx.archive_id, fx.thread_id.clone(), Some(1), Some(10))
++        .await
++        .unwrap_err()
++        .contains("Permission"));
++}
++
++async fn save_attachments_writes_files() {
++    let fx = fixture().await;
++    let tools = BichonMcpTools::new(admin());
++    let saved = tools
++        .save_attachments(fx.archive_id, fx.original_id.clone(), None)
++        .await
++        .unwrap();
++    let saved = serde_json::to_value(saved.0).unwrap();
++    let path = saved[0]["path"].as_str().unwrap();
++    assert!(path.contains("attachments/archive@example.com/2026-10-06 "));
++    assert!(path.ends_with("akt.pdf"));
++    assert_eq!(std::fs::read(path).unwrap(), b"PDFDATA");
++
++    let email = serde_json::to_value(
++        tools
++            .get_email(fx.archive_id, fx.original_id.clone(), None)
++            .await
++            .unwrap()
++            .0,
++    )
++    .unwrap();
++    let hash = email["attachments"][0]["content_hash"].as_str().unwrap();
++    let one = tools
++        .save_attachments(fx.archive_id, fx.original_id.clone(), Some(hash.into()))
++        .await
++        .unwrap();
++    assert_eq!(one.0.len(), 1);
++    assert!(tools
++        .save_attachments(fx.archive_id, fx.original_id.clone(), Some("nope".into()))
++        .await
++        .unwrap_err()
++        .contains("No such attachment"));
++    assert!(tools
++        .save_attachments(fx.archive_id, fx.reply_id.clone(), None)
++        .await
++        .is_err());
++}
++
++// ── Drafts and sync against the scripted IMAP server ────────────────────────
++
++async fn save_draft_appends_to_drafts_folder() {
++    let (account_id, appended) = imap_account("drafts@example.com", true).await;
++    let att = save(&["out"], "invoice.pdf", b"%PDF-1").unwrap();
++    let tools = BichonMcpTools::new(admin());
++    let saved = tools
++        .save_draft(
++            account_id,
++            Some(vec!["client@example.org".into()]),
++            None,
++            None,
++            Some("Invoice".into()),
++            Some("Please find attached".into()),
++            None,
++            None,
++            Some(vec![att.display().to_string()]),
++            None,
++        )
++        .await
++        .unwrap();
++    let saved = serde_json::to_value(saved.0).unwrap();
++    assert_eq!(saved["folder"], "Drafts");
++    assert_eq!(saved["attachments"][0], "invoice.pdf");
++
++    let drafts = appended.lock().unwrap().clone();
++    let (mailbox, flags, raw) = drafts
++        .iter()
++        .find(|(_, _, raw)| String::from_utf8_lossy(raw).contains("Invoice"))
++        .expect("draft appended");
++    assert_eq!(mailbox, "Drafts");
++    assert_eq!(flags, "(\\Draft \\Seen)");
++    let msg = parse(raw);
++    assert_eq!(
++        msg.from().unwrap().first().unwrap().address(),
++        Some("drafts@example.com")
++    );
++    assert_eq!(
++        msg.attachment(0).unwrap().attachment_name(),
++        Some("invoice.pdf")
++    );
++}
++
++async fn save_draft_explicit_folder_and_errors() {
++    let (account_id, appended) = imap_account("folders@example.com", false).await;
++
++    // No \Drafts attribute on the server: an explicit, known folder is needed.
++    let err = append_draft(account_id, None, b"Subject: x\r\n\r\ny")
++        .await
++        .unwrap_err();
++    assert!(err.contains("no folder as \\Drafts"), "{err}");
++    assert!(append_draft(account_id, Some("Missing"), b"x")
++        .await
++        .unwrap_err()
++        .contains("not known"));
++    MailBox::batch_upsert(&[MailBox {
++        id: account_id ^ 0x5eed,
++        account_id,
++        name: "Drafts".into(),
++        delimiter: Some("/".into()),
++        ..Default::default()
++    }])
++    .unwrap();
++    let folder = append_draft(account_id, Some("Drafts"), b"Subject: x\r\n\r\ny")
++        .await
++        .unwrap();
++    assert_eq!(folder, "Drafts");
++    assert!(!appended.lock().unwrap().is_empty());
++
++    // Drafts only for IMAP accounts, and only with the permission.
++    let fx = fixture().await;
++    let local = save_draft(DraftRequest {
++        account_id: fx.archive_id,
++        ..Default::default()
++    })
++    .await;
++    assert!(local.unwrap_err().contains("only supported for IMAP"));
++    assert!(save_draft(DraftRequest {
++        account_id: u64::MAX,
++        ..Default::default()
++    })
++    .await
++    .unwrap_err()
++    .contains("Account"));
++    let nobody = BichonMcpTools::new(nobody());
++    let denied = nobody
++        .save_draft(
++            account_id, None, None, None, None, None, None, None, None, None,
++        )
++        .await;
++    assert!(denied.unwrap_err().contains("Permission"));
++
++    // A reply must point at a readable message of the same account.
++    let tools = BichonMcpTools::new(admin());
++    let missing = tools
++        .save_draft(
++            account_id,
++            None,
++            None,
++            None,
++            None,
++            Some("t".into()),
++            None,
++            Some("nope".into()),
++            None,
++            None,
++        )
++        .await;
++    assert!(missing.is_err());
++    let reply_elsewhere = save_draft(DraftRequest {
++        account_id,
++        reply_to_envelope_id: Some(fx.original_id.clone()),
++        text: Some("t".into()),
++        ..Default::default()
++    })
++    .await;
++    assert!(reply_elsewhere.unwrap_err().contains("Original message"));
++}
++
++async fn sync_now_runs_and_checks_rights() {
++    let (account_id, _) = imap_account("sync@example.com", true).await;
++    let tools = BichonMcpTools::new(admin());
++    let done = tools.sync_now(account_id, Some(60)).await.unwrap();
++    let done = serde_json::to_value(done.0).unwrap();
++    assert_eq!(done["account"], "sync@example.com");
++    assert!(["finished", "still running"].contains(&done["status"].as_str().unwrap()));
++
++    let fx = fixture().await;
++    assert!(tools
++        .sync_now(fx.archive_id, None)
++        .await
++        .unwrap_err()
++        .contains("Only IMAP"));
++    assert!(tools
++        .sync_now(u64::MAX, None)
++        .await
++        .unwrap_err()
++        .contains("Account"));
++    assert!(BichonMcpTools::new(nobody())
++        .sync_now(account_id, None)
++        .await
++        .unwrap_err()
++        .contains("Permission"));
++}
++
++// ── The HTTP endpoint ───────────────────────────────────────────────────────
++
++async fn endpoint_speaks_mcp_behind_the_token_guard() {
++    let fx = fixture().await;
++    let token = crate::tests::admin_token().await;
++    let cli = TestClient::new(Route::new().nest_no_strip("/mcp", mcp_endpoint().with(ApiGuard)))
++        .default_header("X-Forwarded-For", "127.0.0.1")
++        .default_header("Accept", "application/json, text/event-stream");
++
++    let anonymous = cli.post("/mcp").body_json(&json!({})).send().await;
++    assert_eq!(anonymous.0.status(), StatusCode::UNAUTHORIZED);
++
++    let auth = format!("Bearer {token}");
++    let init = cli
++        .post("/mcp")
++        .header("Authorization", &auth)
++        .body_json(
++            &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
++            "protocolVersion": "2025-06-18", "capabilities": {},
++            "clientInfo": {"name": "test", "version": "0"}}}),
++        )
++        .send()
++        .await;
++    init.assert_status_is_ok();
++    let session = init
++        .0
++        .headers()
++        .get("Mcp-Session-Id")
++        .unwrap()
++        .to_str()
++        .unwrap()
++        .to_string();
++
++    let note = cli
++        .post("/mcp")
++        .header("Authorization", &auth)
++        .header("Mcp-Session-Id", &session)
++        .body_json(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
++        .send()
++        .await;
++    assert_eq!(note.0.status(), StatusCode::ACCEPTED);
++
++    let call = cli
++        .post("/mcp")
++        .header("Authorization", &auth)
++        .header("Mcp-Session-Id", &session)
++        .body_json(
++            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
++            "name": "list_folders", "arguments": {"account_id": fx.archive_id}}}),
++        )
++        .send()
++        .await;
++    call.assert_status_is_ok();
++    let body: Value =
++        serde_json::from_str(&call.0.into_body().into_string().await.unwrap()).unwrap();
++    assert_eq!(body["id"], 2, "a single object, not a batch: {body}");
++    assert_eq!(body["result"]["isError"], false);
++    assert!(body["result"]["content"][0]["text"]
++        .as_str()
++        .unwrap()
++        .contains("INBOX"));
++}
+diff --git a/crates/server/src/mcp/tools.rs b/crates/server/src/mcp/tools.rs
+new file mode 100644
+index 0000000..b617671
+--- /dev/null
++++ b/crates/server/src/mcp/tools.rs
+@@ -0,0 +1,495 @@
++//
++// Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
++//
++// This file is part of the Bichon Email Archiving Project
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++use std::{collections::HashSet, time::Duration};
++
++use bichon_core::{
++    account::{
++        access::{load_readable_with_access, search_scope},
++        migration::{AccountModel, AccountType},
++    },
++    archive::imap::{mailbox::MailBox, task::SYNC_TASKS},
++    common::auth::ClientContext,
++    message::{
++        attachment::retrieve_attachment_content,
++        content::retrieve_email_content,
++        list::get_thread_messages,
++        search::{search_messages_scoped, EmailSearchFilter, EmailSearchRequest},
++    },
++    store::envelope::Envelope,
++    users::permissions::Permission,
++};
++use chrono::{DateTime, NaiveDate, TimeZone, Utc};
++use poem_mcpserver::{content::Json, Tools};
++use serde::Serialize;
++
++use super::{
++    draft::{save_draft, DraftRequest},
++    files,
++};
++
++/// Tools for AI agents over the Bichon archive: find and read mail, pull new
++/// mail now, export attachments, save drafts. Nothing here sends, deletes or
++/// moves mail.
++pub struct BichonMcpTools {
++    context: ClientContext,
++}
++
++/// An envelope trimmed to what an agent needs to pick a message.
++#[derive(Serialize, Debug)]
++pub struct EnvelopeOut {
++    account_id: u64,
++    envelope_id: String,
++    thread_id: String,
++    folder: Option<String>,
++    date: String,
++    from: String,
++    to: Vec<String>,
++    #[serde(skip_serializing_if = "Vec::is_empty")]
++    cc: Vec<String>,
++    subject: String,
++    preview: String,
++    attachments: usize,
++}
++
++impl From<Envelope> for EnvelopeOut {
++    fn from(e: Envelope) -> Self {
++        Self {
++            account_id: e.account_id,
++            envelope_id: e.id,
++            thread_id: e.thread_id,
++            folder: e.mailbox_name,
++            date: format_ms(e.date),
++            from: e.from,
++            to: e.to,
++            cc: e.cc,
++            subject: e.subject,
++            preview: e.preview,
++            attachments: e.regular_attachment_count,
++        }
++    }
++}
++
++#[derive(Serialize, Debug)]
++pub struct PageOut {
++    total: u64,
++    page: u64,
++    messages: Vec<EnvelopeOut>,
++}
++
++#[derive(Serialize, Debug)]
++pub struct AttachmentOut {
++    filename: Option<String>,
++    content_type: String,
++    size: usize,
++    content_hash: String,
++}
++
++#[derive(Serialize, Debug)]
++pub struct EmailOut {
++    #[serde(flatten)]
++    envelope: EnvelopeOut,
++    message_id: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    text: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    html: Option<String>,
++    attachments: Vec<AttachmentOut>,
++}
++
++#[derive(Serialize, Debug)]
++pub struct SavedFile {
++    filename: String,
++    path: String,
++    size: usize,
++}
++
++pub(super) fn format_ms(ms: i64) -> String {
++    Utc.timestamp_millis_opt(ms)
++        .single()
++        .map(|d| d.to_rfc3339())
++        .unwrap_or_default()
++}
++
++/// `YYYY-MM-DD` (UTC midnight) or RFC 3339 → Unix milliseconds.
++pub(super) fn parse_date(value: &str) -> Result<i64, String> {
++    let value = value.trim();
++    if let Ok(d) = DateTime::parse_from_rfc3339(value) {
++        return Ok(d.timestamp_millis());
++    }
++    NaiveDate::parse_from_str(value, "%Y-%m-%d")
++        .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis())
++        .map_err(|_| format!("Bad date {value:?}: use YYYY-MM-DD or RFC 3339"))
++}
++
++fn page_out(page: bichon_core::common::paginated::DataPage<Envelope>, number: u64) -> PageOut {
++    PageOut {
++        total: page.total_items,
++        page: number,
++        messages: page.items.into_iter().map(EnvelopeOut::from).collect(),
++    }
++}
++
++impl BichonMcpTools {
++    pub fn new(context: ClientContext) -> Self {
++        Self { context }
++    }
++
++    fn require(&self, account_id: u64, permission: &str) -> Result<(), String> {
++        self.context
++            .require_permission(Some(account_id), permission)
++            .map_err(|e| format!("Permission denied: {e:#}"))
++    }
++
++    fn readable(&self, account_id: u64, envelope_id: &str) -> Result<Envelope, String> {
++        load_readable_with_access(&self.context, account_id, envelope_id)
++            .map(|(envelope, _)| envelope)
++            .map_err(|e| format!("Message {envelope_id}: {e:#}"))
++    }
++}
++
++#[Tools]
++impl BichonMcpTools {
++    /// List the mail accounts (mailboxes) available to you, with their IDs.
++    pub async fn list_accounts(&self) -> Result<Json<Vec<serde_json::Value>>, String> {
++        let accounts = AccountModel::minimal_list(false)
++            .map_err(|e| format!("Failed to list accounts: {e:#}"))?;
++        Ok(Json(
++            accounts
++                .into_iter()
++                .filter(|a| {
++                    self.context
++                        .has_permission(Some(a.id), Permission::DATA_READ)
++                })
++                .map(|a| serde_json::json!({"account_id": a.id, "email": a.email, "name": a.name}))
++                .collect(),
++        ))
++    }
++
++    /// List the folders of an account as archived: name, message count, IDs for
++    /// `search_emails.folder_ids`.
++    pub async fn list_folders(
++        &self,
++        /// Account ID from list_accounts
++        account_id: u64,
++    ) -> Result<Json<Vec<serde_json::Value>>, String> {
++        self.require(account_id, Permission::DATA_READ)?;
++        let folders =
++            MailBox::list_all(account_id).map_err(|e| format!("Failed to list folders: {e:#}"))?;
++        Ok(Json(
++            folders
++                .into_iter()
++                .map(|m| serde_json::json!({"folder_id": m.id, "name": m.name, "messages": m.exists}))
++                .collect(),
++        ))
++    }
++
++    /// Pull new mail of an account from the mail server now and wait until it is
++    /// archived. Call before searching when the newest mail matters (codes,
++    /// replies that just arrived).
++    pub async fn sync_now(
++        &self,
++        /// Account ID from list_accounts
++        account_id: u64,
++        /// How long to wait for the sync, seconds (default 120, max 600)
++        wait_seconds: Option<u64>,
++    ) -> Result<Json<serde_json::Value>, String> {
++        if !self
++            .context
++            .has_permission(Some(account_id), Permission::ACCOUNT_SYNC)
++        {
++            self.require(account_id, Permission::ACCOUNT_MANAGE)?;
++        }
++        let account = AccountModel::check_account_exists(account_id)
++            .map_err(|e| format!("Account {account_id}: {e:#}"))?;
++        if !matches!(account.account_type, AccountType::IMAP) {
++            return Err("Only IMAP accounts can be synced".into());
++        }
++        let wait = Duration::from_secs(wait_seconds.unwrap_or(120).clamp(5, 600));
++        let started = tokio::time::Instant::now();
++        let deadline = started + wait;
++
++        // A scheduled sync may be running: wait for it to end, then start ours
++        // (incremental, so it only fetches what arrived meanwhile).
++        loop {
++            match SYNC_TASKS.start_manual_task(account_id, false).await {
++                Ok(()) => break,
++                Err(e) if tokio::time::Instant::now() >= deadline => {
++                    return Err(format!(
++                        "Sync did not start within {}s: {e:#}",
++                        wait.as_secs()
++                    ));
++                }
++                Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
++            }
++        }
++        while SYNC_TASKS.is_manual_running(account_id).await {
++            if tokio::time::Instant::now() >= deadline {
++                return Ok(Json(serde_json::json!({
++                    "account": account.email,
++                    "status": "still running",
++                    "elapsed_seconds": started.elapsed().as_secs(),
++                })));
++            }
++            tokio::time::sleep(Duration::from_millis(500)).await;
++        }
++        Ok(Json(serde_json::json!({
++            "account": account.email,
++            "status": "finished",
++            "elapsed_seconds": started.elapsed().as_secs(),
++        })))
++    }
++
++    /// Search archived mail (all folders, everything ever downloaded, including
++    /// mail deleted on the server since). Newest first, or by relevance when
++    /// `text` is given.
++    // Each argument is a field of the MCP tool's input schema.
++    #[allow(clippy::too_many_arguments)]
++    pub async fn search_emails(
++        &self,
++        /// Full-text query over subject, body, addresses
++        text: Option<String>,
++        /// Words in the subject
++        subject: Option<String>,
++        /// Sender address or name
++        from: Option<String>,
++        /// Recipient address (To)
++        to: Option<String>,
++        /// Address in From, To, Cc or Bcc
++        participant: Option<String>,
++        /// Sent on or after this date (YYYY-MM-DD or RFC 3339)
++        since: Option<String>,
++        /// Sent before this date (YYYY-MM-DD or RFC 3339)
++        before: Option<String>,
++        /// Limit to these accounts (IDs from list_accounts)
++        account_ids: Option<Vec<u64>>,
++        /// Limit to these folders (IDs from list_folders)
++        folder_ids: Option<Vec<u64>>,
++        /// Only messages with (true) or without (false) attachments
++        has_attachment: Option<bool>,
++        /// Words in an attachment file name
++        attachment_name: Option<String>,
++        /// Page number, from 1 (default 1)
++        page: Option<u64>,
++        /// Messages per page (default 20, max 100)
++        page_size: Option<u64>,
++    ) -> Result<Json<PageOut>, String> {
++        let filter = EmailSearchFilter {
++            text,
++            subject,
++            from,
++            to,
++            any_participant: participant,
++            since: since.as_deref().map(parse_date).transpose()?,
++            before: before.as_deref().map(parse_date).transpose()?,
++            account_ids: account_ids.map(|ids| ids.into_iter().collect::<HashSet<_>>()),
++            mailbox_ids: folder_ids.map(|ids| ids.into_iter().collect()),
++            has_attachment,
++            attachment_name,
++            ..Default::default()
++        };
++        let scope = search_scope(&self.context, filter.account_ids.as_ref())
++            .map_err(|e| format!("Permission denied: {e:#}"))?;
++        let page = page.unwrap_or(1).max(1);
++        let request = EmailSearchRequest {
++            filter,
++            page,
++            page_size: page_size.unwrap_or(20).clamp(1, 100),
++            sort_by: None,
++            desc: Some(true),
++        };
++        search_messages_scoped(scope, request)
++            .map(|result| Json(page_out(result, page)))
++            .map_err(|e| format!("Search failed: {e:#}"))
++    }
++
++    /// Read one message: headers, plain-text body and the list of attachments
++    /// (use save_attachments to get the files).
++    pub async fn get_email(
++        &self,
++        /// Account ID
++        account_id: u64,
++        /// envelope_id from search_emails or get_thread
++        envelope_id: String,
++        /// Also return the HTML body (remote content stripped); default false.
++        /// HTML-only mail always has `text` converted from the HTML.
++        include_html: Option<bool>,
++    ) -> Result<Json<EmailOut>, String> {
++        let envelope_id = envelope_id.trim().to_string();
++        let envelope = self.readable(account_id, &envelope_id)?;
++        let content = retrieve_email_content(account_id, envelope_id.clone(), true)
++            .map_err(|e| format!("Failed to read message: {e:#}"))?;
++        let want_html = include_html.unwrap_or(false) || content.text.is_none();
++        let message_id = envelope.message_id.clone();
++        Ok(Json(EmailOut {
++            envelope: envelope.into(),
++            message_id,
++            text: content.text,
++            html: if want_html { content.html } else { None },
++            attachments: content
++                .attachments
++                .unwrap_or_default()
++                .into_iter()
++                .map(|a| AttachmentOut {
++                    filename: a.filename,
++                    content_type: a.file_type,
++                    size: a.size,
++                    content_hash: a.content_hash,
++                })
++                .collect(),
++        }))
++    }
++
++    /// List the messages of a conversation (thread), oldest to newest page by page.
++    pub async fn get_thread(
++        &self,
++        /// Account ID
++        account_id: u64,
++        /// thread_id from search_emails or get_email
++        thread_id: String,
++        /// Page number, from 1 (default 1)
++        page: Option<u64>,
++        /// Messages per page (default 50, max 100)
++        page_size: Option<u64>,
++    ) -> Result<Json<PageOut>, String> {
++        self.require(account_id, Permission::DATA_READ)?;
++        let page = page.unwrap_or(1).max(1);
++        get_thread_messages(
++            account_id,
++            thread_id.trim(),
++            page,
++            page_size.unwrap_or(50).clamp(1, 100),
++        )
++        .map(|result| Json(page_out(result, page)))
++        .map_err(|e| format!("Failed to read thread: {e:#}"))
++    }
++
++    /// Save attachments of a message as files in the shared file directory and
++    /// return their paths. Without content_hash, saves all regular attachments.
++    pub async fn save_attachments(
++        &self,
++        /// Account ID
++        account_id: u64,
++        /// envelope_id of the message
++        envelope_id: String,
++        /// content_hash of one attachment (from get_email); omit for all
++        content_hash: Option<String>,
++    ) -> Result<Json<Vec<SavedFile>>, String> {
++        let envelope_id = envelope_id.trim().to_string();
++        let envelope = self.readable(account_id, &envelope_id)?;
++        let content = retrieve_email_content(account_id, envelope_id.clone(), true)
++            .map_err(|e| format!("Failed to read message: {e:#}"))?;
++        let wanted: Vec<_> = content
++            .attachments
++            .unwrap_or_default()
++            .into_iter()
++            .filter(|a| match &content_hash {
++                Some(hash) => a.content_hash == hash.trim(),
++                None => !a.inline,
++            })
++            .collect();
++        if wanted.is_empty() {
++            return Err("No such attachment in this message".into());
++        }
++        let account = envelope
++            .account_email
++            .clone()
++            .unwrap_or_else(|| account_id.to_string());
++        let day = format_ms(envelope.date)
++            .chars()
++            .take(10)
++            .collect::<String>();
++        let folder = format!(
++            "{day} {}",
++            envelope.subject.chars().take(60).collect::<String>()
++        );
++        let mut saved = Vec::new();
++        for attachment in wanted {
++            let mut reader = retrieve_attachment_content(
++                account_id,
++                envelope_id.clone(),
++                &attachment.content_hash,
++            )
++            .map_err(|e| format!("Failed to read attachment: {e:#}"))?;
++            let mut bytes = Vec::new();
++            std::io::Read::read_to_end(&mut reader, &mut bytes)
++                .map_err(|e| format!("Failed to read attachment: {e}"))?;
++            let name = attachment
++                .filename
++                .clone()
++                .unwrap_or_else(|| attachment.content_hash.clone());
++            let path = files::save(&["attachments", &account, &folder], &name, &bytes)?;
++            saved.push(SavedFile {
++                filename: name,
++                path: path.display().to_string(),
++                size: bytes.len(),
++            });
++        }
++        Ok(Json(saved))
++    }
++
++    /// Save a draft into the account's Drafts folder on the mail server (it then
++    /// shows up in the provider's web mail). Never sends. For a reply give
++    /// reply_to_envelope_id: threading headers are set, and `to`/`subject`
++    /// default to the original sender and "Re: <subject>".
++    #[allow(clippy::too_many_arguments)]
++    pub async fn save_draft(
++        &self,
++        /// Account ID to save the draft in (its address is the sender)
++        account_id: u64,
++        /// Recipient addresses (may be empty for a reply)
++        to: Option<Vec<String>>,
++        /// Cc addresses
++        cc: Option<Vec<String>>,
++        /// Bcc addresses
++        bcc: Option<Vec<String>>,
++        /// Subject (default for a reply: "Re: <original subject>")
++        subject: Option<String>,
++        /// Plain-text body
++        text: Option<String>,
++        /// HTML body
++        html: Option<String>,
++        /// envelope_id of the message this draft replies to
++        reply_to_envelope_id: Option<String>,
++        /// Paths of files to attach; only files in the shared file directory
++        attachments: Option<Vec<String>>,
++        /// Folder name from list_folders, if the server does not mark a Drafts folder
++        folder: Option<String>,
++    ) -> Result<Json<serde_json::Value>, String> {
++        self.require(account_id, Permission::DATA_DRAFT)?;
++        if let Some(id) = &reply_to_envelope_id {
++            self.readable(account_id, id.trim())?;
++        }
++        let saved = save_draft(DraftRequest {
++            account_id,
++            to: to.unwrap_or_default(),
++            cc: cc.unwrap_or_default(),
++            bcc: bcc.unwrap_or_default(),
++            subject,
++            text,
++            html,
++            reply_to_envelope_id: reply_to_envelope_id.map(|id| id.trim().to_string()),
++            attachments: attachments.unwrap_or_default(),
++            folder,
++        })
++        .await?;
++        serde_json::to_value(saved)
++            .map(Json)
++            .map_err(|e| e.to_string())
++    }
++}
+diff --git a/crates/server/src/rest/mod.rs b/crates/server/src/rest/mod.rs
+index 3c609ad..3b2fbd9 100644
+--- a/crates/server/src/rest/mod.rs
++++ b/crates/server/src/rest/mod.rs
+@@ -123,6 +123,19 @@ pub fn build_routes() -> impl Endpoint {
+         )
+         .nest_no_strip("/api/v1", open_api_route);
+ 
++    // svesh: MCP for agents. No Timeout: sync_now waits for the sync itself.
++    let app_logic = if crate::mcp::MCP_SETTINGS.enabled {
++        app_logic.nest_no_strip(
++            "/mcp",
++            crate::mcp::mcp_endpoint()
++                .with(ApiGuard)
++                .with(ErrorCapture)
++                .with(Tracing),
++        )
++    } else {
++        app_logic
++    };
++
+     let app_logic = add_web_assets(app_logic);
+ 
+     Route::new()
