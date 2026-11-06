@@ -60,6 +60,19 @@ comparison in gap-fill, immediate reconnects.
   with the raw message, for bodies a server no longer hands out but a mail client's offline
   copy has. Answers `stored`, `exists` (UID archived), `duplicate` (same content under another
   UID) or `filtered` (archive rules).
+- **Encrypted backups** (`crates/core/src/backup/svesh_crypt.rs`, `svesh_engine.rs`): with
+  `BICHON_BACKUP_KEY` set, Bichon's native backup encrypts every object, manifest and
+  `LATEST` before upload. HKDF-SHA256 from the 32-byte key gives an AES-256-GCM content key
+  and an HMAC name key; objects are `BCHE1` + a random 7-byte nonce prefix + 64 KiB segments
+  (STREAM: nonce = prefix ‖ counter ‖ last flag, AAD = the object's name), so truncation,
+  reordering and swapping fail. Object names are HMAC(name key, plaintext SHA-256): stable for
+  deduplication, useless for "is this message in there". Encrypted layout under
+  `<prefix>/v1e/`; a target holding the other layout is refused. No key = upstream behaviour.
+  Restore and drill need the same key. Also fixes a flush race in `download_object` (a tokio
+  file could still be writing its tail after return).
+- **Yearly restore points**: `keep_yearly` in the retention policy (newest point per UTC
+  year); the backup form shows all tiers (last, daily, weekly, monthly, yearly) and saves them
+  as they are (upstream's form exposed only "last N" and zeroed the others).
 - **Russian search** (`crates/core/src/store/tantivy/svesh_ru.rs`, two filters in upstream's
   word analyzer): `ё` → `е`, and every Cyrillic token reduced to its Snowball Russian stem
   before the transliteration, so «договором», «договоры», «договор» are one term and «счёт»
@@ -92,6 +105,7 @@ The web job type-checks and runs the tests of the account and user pages.
 | `BICHON_LOG_FILTER` | per-target log levels, `RUST_LOG` syntax (e.g. `info,poem_mcpserver=warn`: the MCP library logs whole requests and responses at info); overrides `BICHON_LOG_LEVEL` |
 | `BICHON_IMAP_RECONNECT_DELAYS` | gentle mode: seconds to wait before each reconnect after a dropped connection, comma-separated (default `30,60,120`, the last repeats; `0` = no wait). Default for accounts without their own "Reconnect delays" |
 | `BICHON_IMAP_FETCH_CHUNK_KB` | chunked body download, part size in KB (4–65536; Thunderbird uses 136); unset or 0 — off, upstream behaviour. Default for accounts without their own "Chunk size" |
+| `BICHON_BACKUP_KEY` | backup encryption key: 64 hex characters or base64 of 32 bytes. Set → every backup, restore and drill is encrypted (set but empty is an error, not "off"). Losing it loses the backups made with it |
 
 ## Agent access
 

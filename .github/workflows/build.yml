@@ -66,7 +66,7 @@ jobs:
         run: |
           npx --yes pnpm@10.34.6 install --frozen-lockfile
           npx --yes pnpm@10.34.6 exec tsc -b
-          npx --yes pnpm@10.34.6 exec vitest run src/features/accounts src/features/users
+          npx --yes pnpm@10.34.6 exec vitest run src/features/accounts src/features/users src/features/backup
 
   build:
     needs: check

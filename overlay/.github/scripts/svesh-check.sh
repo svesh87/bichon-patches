@@ -21,8 +21,13 @@ crates/server/src/rest/api/service_accounts.rs
 crates/server/src/tests/service_account_tests.rs
 crates/server/src/svesh_import.rs
 crates/core/src/store/tantivy/svesh_ru.rs
-crates/core/src/store/tantivy/svesh_ru_tests.rs"
-OWN_RE='^(crates/server/src/(mcp/|svesh_import|rest/api/service_accounts|tests/service_account_tests)|crates/core/src/imap/(chunked|reconnect)|crates/core/src/archive/imap/download/unchanged|crates/core/src/logger/filter|crates/core/src/users/service|crates/core/src/store/tantivy/svesh_ru)'
+crates/core/src/store/tantivy/svesh_ru_tests.rs
+crates/core/src/backup/svesh_crypt.rs
+crates/core/src/backup/svesh_crypt_tests.rs
+crates/core/src/backup/svesh_engine.rs
+crates/core/src/backup/svesh_engine_tests.rs
+crates/core/src/backup/svesh_retention_tests.rs"
+OWN_RE='^(crates/server/src/(mcp/|svesh_import|rest/api/service_accounts|tests/service_account_tests)|crates/core/src/imap/(chunked|reconnect)|crates/core/src/archive/imap/download/unchanged|crates/core/src/logger/filter|crates/core/src/users/service|crates/core/src/store/tantivy/svesh_ru|crates/core/src/backup/svesh_)'
 
 echo "== rustfmt"
 # shellcheck disable=SC2086 # the list is globs
@@ -44,12 +49,12 @@ cargo llvm-cov clean --workspace
 cargo llvm-cov --no-report --locked -p bichon-server --lib -- mcp::
 # Own process: SETTINGS are set once per process and the MCP tests need theirs.
 cargo llvm-cov --no-report --locked -p bichon-server --lib -- tests::service_account_tests
-cargo llvm-cov --no-report --locked -p bichon-core --lib -- imap::chunked imap::reconnect archive::imap::download logger::filter store::tantivy::svesh_ru
+cargo llvm-cov --no-report --locked -p bichon-core --lib -- imap::chunked imap::reconnect archive::imap::download logger::filter store::tantivy::svesh_ru backup::svesh_crypt backup::engine::svesh_engine backup::retention::svesh_tests
 cargo llvm-cov report --json --summary-only --output-path cov.json
 python3 -I - "$MIN_COVERAGE" <<'EOF'
 import json, re, sys
 minimum = float(sys.argv[1])
-own = re.compile(r"/crates/(server/src/(mcp/|svesh_import\.rs|rest/api/service_accounts\.rs)|core/src/imap/(chunked|reconnect)\.rs|core/src/archive/imap/download/unchanged\.rs|core/src/logger/filter\.rs|core/src/users/service\.rs|core/src/store/tantivy/svesh_ru\.rs)")
+own = re.compile(r"/crates/(server/src/(mcp/|svesh_import\.rs|rest/api/service_accounts\.rs)|core/src/imap/(chunked|reconnect)\.rs|core/src/archive/imap/download/unchanged\.rs|core/src/logger/filter\.rs|core/src/users/service\.rs|core/src/store/tantivy/svesh_ru\.rs|core/src/backup/svesh_(crypt|engine)\.rs)")
 files = [f for f in json.load(open("cov.json"))["data"][0]["files"]
          if own.search(f["filename"]) and not f["filename"].endswith("tests.rs")]
 covered = sum(f["summary"]["lines"]["covered"] for f in files)
